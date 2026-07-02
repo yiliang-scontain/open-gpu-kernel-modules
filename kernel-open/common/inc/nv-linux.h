@@ -1241,6 +1241,12 @@ typedef struct
 struct nv_pci_tegra_devfreq_data;
 struct nv_pci_tegra_devfreq_dev;
 
+typedef struct nv_scone_gpu_lock_holder_s
+{
+    struct list_head entry;
+    pid_t tgid;
+} nv_scone_gpu_lock_holder_t;
+
 /* linux-specific version of old nv_state_t */
 /* this is a general os-specific state structure. the first element *must* be
    the general state structure, for the generic unix-based code */
@@ -1248,6 +1254,12 @@ typedef struct nv_linux_state_s {
     nv_state_t nv_state;
 
     atomic64_t usage_count;
+    
+    NvBool scone_gpu_locked;
+    NvU32 scone_gpu_lock_secret_len;
+    NvU8  scone_gpu_lock_secret[NV_SCONE_GPU_LOCK_SECRET_MAX];
+    struct list_head scone_gpu_lock_holders;
+    atomic64_t scone_gpu_locked_counter;
 
     NvU32    suspend_count;
 
@@ -1502,6 +1514,7 @@ typedef struct
     struct completion open_complete;
     nv_linux_state_t *deferred_open_nvl;
     int open_rc;
+    pid_t tgid;
     NV_STATUS adapter_status;
 
     struct list_head entry;

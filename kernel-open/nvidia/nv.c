@@ -86,6 +86,7 @@
 #endif
 
 #include <linux/dmi.h>              /* System DMI info */
+#include <trace/events/sched.h>     /* sched_process_exit tracepoint    */
 
 #include <linux/ioport.h>
 
@@ -245,6 +246,9 @@ static int           nvidia_close          (struct inode *, struct file *);
 static unsigned int  nvidia_poll           (struct file *, poll_table *);
 static int           nvidia_ioctl          (struct inode *, struct file *, unsigned int, unsigned long);
 static long          nvidia_unlocked_ioctl (struct file *, unsigned int, unsigned long);
+
+static int           nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *, nv_linux_state_t * nvl, nv_state_t *nv);
+static void          nv_scone_gpu_lock_release(nv_linux_state_t *nvl);
 
 /* character device entry points*/
 static struct file_operations nvidia_fops = {
@@ -1165,6 +1169,181 @@ static nv_linux_state_t *find_minor(NvU32 minor)
     return nvl;
 }
 
+static nv_scone_gpu_lock_holder_t *
+nv_scone_gpu_lock_find_holder_locked(nv_linux_state_t *nvl, pid_t tgid)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+
+    list_for_each_entry(holder, &nvl->scone_gpu_lock_holders, entry)
+    {
+        if (holder->tgid == tgid)
+            return holder;
+    }
+
+    return NULL;
+}
+
+static NvBool
+nv_scone_gpu_lock_secret_matches_locked
+(
+    nv_linux_state_t *nvl,
+    const nv_ioctl_scone_gpu_lock_t *params
+)
+{
+    NvU32 i;
+    NvU8 diff = 0;
+
+    if (nvl->scone_gpu_lock_secret_len != params->secret_len)
+        return NV_FALSE;
+
+    for (i = 0; i < params->secret_len; i++)
+        diff |= nvl->scone_gpu_lock_secret[i] ^ params->secret[i];
+
+    return diff == 0 ? NV_TRUE : NV_FALSE;
+}
+
+static void
+nv_scone_gpu_lock_clear_locked(nv_linux_state_t *nvl)
+{
+    nvl->scone_gpu_locked = NV_FALSE;
+    nvl->scone_gpu_lock_secret_len = 0;
+    memzero_explicit(nvl->scone_gpu_lock_secret,
+                     sizeof(nvl->scone_gpu_lock_secret));
+}
+
+static NvBool
+nv_scone_gpu_lock_current_process_can_open_locked(nv_linux_state_t *nvl, pid_t tgid)
+{
+    /* Fixme: Should we allow any kernel threads to open the device? */
+    if (!nvl->scone_gpu_locked || current->flags & PF_KTHREAD)
+        return NV_TRUE;
+
+    return nv_scone_gpu_lock_find_holder_locked(nvl, tgid) != NULL;
+}
+
+static int
+nv_scone_gpu_lock_add_current_thread_group_locked
+(
+    nv_linux_state_t *nvl,
+    const nv_ioctl_scone_gpu_lock_t *params
+)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+
+    holder = nv_scone_gpu_lock_find_holder_locked(nvl, current->tgid);
+    if (holder != NULL)
+    {
+        return 0;
+    }
+
+    NV_KZALLOC(holder, sizeof(*holder));
+    if (holder == NULL)
+        return -ENOMEM;
+
+    holder->tgid = current->tgid;
+    list_add(&holder->entry, &nvl->scone_gpu_lock_holders);
+
+    if (!nvl->scone_gpu_locked)
+    {
+        nvl->scone_gpu_locked = NV_TRUE;
+        nvl->scone_gpu_lock_secret_len = params->secret_len;
+        atomic64_set(&nvl->scone_gpu_locked_counter, 1);
+        memcpy(nvl->scone_gpu_lock_secret, params->secret, params->secret_len);
+    }
+
+    return 0;
+}
+
+static int
+nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *params, nv_linux_state_t * nvl, nv_state_t *nv)
+{
+    int rc = 0;
+    bool is_ctl_device = false;
+
+    if ((params->version != NV_SCONE_GPU_LOCK_VERSION) ||
+        (params->flags != 0) ||
+        (params->secret_len == 0) ||
+        (params->secret_len > NV_SCONE_GPU_LOCK_SECRET_MAX))
+    {
+        return -EINVAL;
+    }
+
+    /* Every device should only be able to lock itself */
+    if (((nv)->flags & NV_FLAG_CONTROL) != 0)
+    {
+        if (params->minor_number != NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
+            return -EINVAL;
+        
+        is_ctl_device = true;
+    }
+    else 
+    {
+        if (nvl->minor_num != params->minor_number)
+            return -EINVAL;
+    }
+
+    down(&nvl->ldata_lock);
+
+    if (nvl->scone_gpu_locked &&
+        !nv_scone_gpu_lock_secret_matches_locked(nvl, params))
+    {
+        pr_err("secret does not match\n");
+        rc = -EBUSY;
+        goto done;
+    }
+    /* Should acquire the lock after the first open for device */
+    else if (!nvl->scone_gpu_locked)
+                
+    {
+        int usage_count = atomic64_read(&nvl->usage_count);
+        if (is_ctl_device && usage_count > 1)
+        {
+            pr_err("nvidiactl cannot be locked when opened by others!\n");
+            pr_err("current usage_count is %d\n", usage_count);
+            rc = -EBUSY;
+            goto done;
+        }
+
+        if (!is_ctl_device && usage_count > 2)
+        {
+            pr_err("nvidia device cannot be locked when opened by no kernel threads!\n");
+            pr_err("current usage_count is %d\n", usage_count);
+            rc = -EBUSY;
+            goto done;
+        }
+    } 
+    
+    rc = nv_scone_gpu_lock_add_current_thread_group_locked(nvl, params);
+
+done:
+    memzero_explicit(params->secret, sizeof(params->secret));
+    up(&nvl->ldata_lock);
+    return rc;
+}
+
+static void
+nv_scone_gpu_lock_release(nv_linux_state_t *nvl)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+    nv_scone_gpu_lock_holder_t *tmp;
+    LOCK_NV_LINUX_DEVICES();
+    down(&nvl->ldata_lock);
+    if (atomic64_dec_and_test(&nvl->scone_gpu_locked_counter))
+    {
+        if (!list_empty(&nvl->scone_gpu_lock_holders))
+        {
+            list_for_each_entry_safe(holder, tmp, &nvl->scone_gpu_lock_holders, entry)
+            {
+                list_del(&holder->entry);
+                NV_KFREE(holder, sizeof(*holder));
+            }
+        }
+        nv_scone_gpu_lock_clear_locked(nvl);
+    }
+    up(&nvl->ldata_lock);
+    UNLOCK_NV_LINUX_DEVICES();
+}
+
 /*
  * Search the global list of nv devices for the one with the given gpu_id.
  * If found, nvl is returned with nvl->ldata_lock taken.
@@ -1644,7 +1823,7 @@ failed:
  * Makes sure the device is ready for operations and increases nvl->usage_count.
  * Assumes nvl->ldata_lock is held.
  */
-static int nv_open_device(nv_state_t *nv, nvidia_stack_t *sp)
+static int nv_open_device(nv_state_t *nv, nvidia_stack_t *sp, pid_t tgid)
 {
     nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
     int rc;
@@ -1712,6 +1891,18 @@ static int nv_open_device(nv_state_t *nv, nvidia_stack_t *sp)
         return -EBUSY;
     }
 
+    if (!nv_scone_gpu_lock_current_process_can_open_locked(nvl, tgid))
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "open() not permitted: SCONE GPU lock is held by another process\n");
+        return -EACCES;
+    }
+
+    if (nvl->scone_gpu_locked)
+    {
+        atomic64_inc(&nvl->scone_gpu_locked_counter);
+    }
+
     nv_assert_not_in_gpu_exclusion_list(sp, nv);
 
     atomic64_inc(&nvl->usage_count);
@@ -1756,7 +1947,7 @@ static int nv_open_device_for_nvlfp(
     nv_linux_file_private_t *nvlfp
 )
 {
-    nvlfp->open_rc = nv_open_device(nv, sp);
+    nvlfp->open_rc = nv_open_device(nv, sp, nvlfp->tgid);
 
     if (nvlfp->open_rc == 0)
     {
@@ -1917,6 +2108,10 @@ nvidia_open(
 
     nv = NV_STATE_PTR(nvl);
     nv_init_mapping_revocation(nvl, file, nvlfp, inode);
+
+    /* The open of device can be deferred to a kernel thread */
+    /* Record the real tgid to clearify ownership            */
+    nvlfp->tgid = current->tgid;
 
     if (nv_try_lock_foreground_open(file, nvl) == 0)
     {
@@ -2177,6 +2372,7 @@ nvidia_close_callback(
 
     nv = NV_STATE_PTR(nvl);
 
+    nv_scone_gpu_lock_release(nvl);
     rm_cleanup_file_private(sp, nv, &nvlfp->nvfp);
 
     down(&nvl->mmap_lock);
@@ -2430,6 +2626,7 @@ static NV_STATUS nv_validate_ioctls(unsigned int cmd)
         _NV_IOCTL_ENTRY(NV_ESC_WAIT_OPEN_COMPLETE, nv_ioctl_wait_open_complete_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_NUMA_INFO, nv_ioctl_numa_info_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_SET_NUMA_STATUS, nv_ioctl_set_numa_status_t, NV_FALSE),
+        _NV_IOCTL_ENTRY(NV_ESC_SCONE_GPU_LOCK, nv_ioctl_scone_gpu_lock_t, NV_FALSE),
     };
 
     status = rm_validate_ioctls(cmd, arg_size);
@@ -2722,6 +2919,20 @@ nvidia_ioctl(
                     0 : -EBUSY;
                 goto done;
             }
+            break;
+        }
+
+        case NV_ESC_SCONE_GPU_LOCK:
+        {
+            nv_ioctl_scone_gpu_lock_t *params = arg_copy;
+
+            if (arg_size != sizeof(nv_ioctl_scone_gpu_lock_t))
+            {
+                status = -EINVAL;
+                goto done;
+            }
+
+            status = nv_scone_gpu_lock_ioctl(params, nvl, nv);
             break;
         }
 
@@ -3172,6 +3383,11 @@ nvidia_ctl_open(
 
     down(&nvl->ldata_lock);
 
+    if (!nv_scone_gpu_lock_current_process_can_open_locked(nvl, current->tgid)) {
+        up(&nvl->ldata_lock);
+        return -EBUSY;
+    }
+
     /* save the nv away in file->private_data */
     nvlfp->nvptr = nvl;
 
@@ -3211,6 +3427,7 @@ nvidia_ctl_close(
     }
     up(&nvl->ldata_lock);
 
+    nv_scone_gpu_lock_release(nvl);
     rm_cleanup_file_private(sp, nv, &nvlfp->nvfp);
 
     if (nvlfp->free_list != NULL)
@@ -4051,6 +4268,7 @@ NvBool nv_lock_init_locks
     NV_INIT_MUTEX(&nvl->open_q_lock);
 
     atomic64_set(&nvl->usage_count, 0);
+    INIT_LIST_HEAD(&nvl->scone_gpu_lock_holders);
 
     if (!rm_init_event_locks(sp, nv))
         return NV_FALSE;
@@ -4064,6 +4282,20 @@ void nv_lock_destroy_locks
     nv_state_t *nv
 )
 {
+    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+    nv_scone_gpu_lock_holder_t *holder;
+    nv_scone_gpu_lock_holder_t *tmp;
+
+    if (!list_empty(&nvl->scone_gpu_lock_holders))
+    {
+        list_for_each_entry_safe(holder, tmp, &nvl->scone_gpu_lock_holders, entry)
+        {
+            list_del(&holder->entry);
+            NV_KFREE(holder, sizeof(*holder));
+        }
+        nv_scone_gpu_lock_clear_locked(nvl);
+    }
+
     rm_destroy_event_locks(sp, nv);
 }
 
@@ -5337,7 +5569,7 @@ int nvidia_dev_get(NvU32 gpu_id, nvidia_stack_t *sp, NvBool reset_aware)
     if (!nvl)
         return -ENODEV;
 
-    rc = nv_open_device(NV_STATE_PTR(nvl), sp);
+    rc = nv_open_device(NV_STATE_PTR(nvl), sp, current->tgid);
 
     if (rc == 0 && !reset_aware)
     {
@@ -5397,7 +5629,7 @@ int nvidia_dev_get_uuid(const NvU8 *uuid, nvidia_stack_t *sp)
          * If the device is missing its UUID, this call exists solely so
          * rm_get_gpu_uuid_raw will be called and we can inspect the UUID.
          */
-        rc = nv_open_device(nv, sp);
+        rc = nv_open_device(nv, sp, current->tgid);
         if (rc != 0)
             goto out;
 
