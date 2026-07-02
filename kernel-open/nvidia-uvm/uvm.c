@@ -138,6 +138,111 @@ err:
     return status;
 }
 
+
+static nv_scone_gpu_lock_holder_t *
+uvm_scone_gpu_lock_find_holder_locked(uvm_global_t *uvm_global, pid_t tgid)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+
+    list_for_each_entry(holder, &uvm_global->scone_gpu_lock_holders, entry)
+    {
+        if (holder->tgid == tgid)
+            return holder;
+    }
+
+    return NULL;
+}
+
+static NvBool
+uvm_scone_gpu_lock_current_process_can_open_locked(uvm_global_t *uvm_global, pid_t tgid)
+{
+    if (!uvm_global->scone_gpu_locked)
+        return NV_TRUE;
+
+    return uvm_scone_gpu_lock_find_holder_locked(uvm_global, tgid) != NULL;
+}
+
+static NvBool
+uvm_scone_gpu_lock_secret_matches_locked
+(
+    uvm_global_t *uvm_global,
+    const UVM_LOCK_DRIVER_PARAMS *params
+)
+{
+    NvU32 i;
+    NvU8 diff = 0;
+
+    if (uvm_global->scone_gpu_lock_secret_len != params->secret_len)
+        return NV_FALSE;
+
+    for (i = 0; i < params->secret_len; i++)
+        diff |= uvm_global->scone_gpu_lock_secret[i] ^ params->secret[i];
+
+    return diff == 0 ? NV_TRUE : NV_FALSE;
+}
+
+static void
+uvm_scone_gpu_lock_clear_locked(uvm_global_t *uvm_global)
+{
+    uvm_global->scone_gpu_locked = NV_FALSE;
+    uvm_global->scone_gpu_lock_secret_len = 0;
+    memzero_explicit(uvm_global->scone_gpu_lock_secret,
+                     sizeof(uvm_global->scone_gpu_lock_secret));
+}
+
+static int
+uvm_scone_gpu_lock_add_current_thread_group_locked
+(
+    uvm_global_t *uvm_global,
+    const UVM_LOCK_DRIVER_PARAMS *params
+)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+
+    holder = uvm_scone_gpu_lock_find_holder_locked(uvm_global, current->tgid);
+    if (holder != NULL)
+    {
+        return 0;
+    }
+
+    NV_KZALLOC(holder, sizeof(*holder));
+    if (holder == NULL)
+        return -ENOMEM;
+
+    holder->tgid = current->tgid;
+    list_add(&holder->entry, &uvm_global->scone_gpu_lock_holders);
+
+    if (!uvm_global->scone_gpu_locked)
+    {
+        uvm_global->scone_gpu_locked = NV_TRUE;
+        uvm_global->scone_gpu_lock_secret_len = params->secret_len;
+        memcpy(uvm_global->scone_gpu_lock_secret, params->secret, params->secret_len);
+    }
+
+    return 0;
+}
+
+static void
+uvm_scone_gpu_lock_release(uvm_global_t *uvm_global)
+{
+    nv_scone_gpu_lock_holder_t *holder;
+    nv_scone_gpu_lock_holder_t *tmp;
+
+    if (atomic64_dec_and_test(&uvm_global->open_counter)) {
+        uvm_mutex_lock(&uvm_global->global_lock);
+        if (!list_empty(&uvm_global->scone_gpu_lock_holders))
+        {
+            list_for_each_entry_safe(holder, tmp, &uvm_global->scone_gpu_lock_holders, entry)
+            {
+                list_del(&holder->entry);
+                NV_KFREE(holder, sizeof(*holder));
+            }
+        }
+        uvm_scone_gpu_lock_clear_locked(uvm_global);
+        uvm_mutex_unlock(&uvm_global->global_lock);
+    }
+}
+
 // Called when opening /dev/nvidia-uvm. This code doesn't take any UVM locks, so
 // there's no need to acquire g_uvm_global.pm.lock, but if that changes the PM
 // lock will need to be taken.
@@ -152,6 +257,12 @@ static int uvm_open(struct inode *inode, struct file *filp)
     mapping = uvm_kvmalloc(sizeof(*mapping));
     if (!mapping)
         return -ENOMEM;
+
+    uvm_mutex_lock(&g_uvm_global.global_lock);
+    if (!uvm_scone_gpu_lock_current_process_can_open_locked(&g_uvm_global, current->tgid)) {
+        return -EBUSY;
+    }
+    uvm_mutex_unlock(&g_uvm_global.global_lock);
 
     // By default all struct files on the same inode share the same
     // address_space structure (the inode's) across all processes. This means
@@ -174,6 +285,7 @@ static int uvm_open(struct inode *inode, struct file *filp)
 
     filp->private_data = NULL;
     filp->f_mapping = mapping;
+    atomic64_inc(&g_uvm_global.open_counter);
 
     return NV_OK;
 }
@@ -272,6 +384,8 @@ static int uvm_release(struct inode *inode, struct file *filp)
         default:
             UVM_ASSERT_MSG(0, "Unexpected fd type: %d\n", fd_type);
     }
+
+    uvm_scone_gpu_lock_release(&g_uvm_global);
 
     return 0;
 }
@@ -993,6 +1107,50 @@ static NV_STATUS uvm_api_pageable_mem_access(UVM_PAGEABLE_MEM_ACCESS_PARAMS *par
     return NV_OK;
 }
 
+static NV_STATUS uvm_api_lock_driver(UVM_LOCK_DRIVER_PARAMS *params, struct file *filp)
+{
+    uvm_global_t *uvm_global = &g_uvm_global;
+    int rc = 0;
+
+    if ((params->version != NV_SCONE_GPU_LOCK_VERSION) ||
+        (params->flags != 0) ||
+        (params->secret_len == 0) ||
+        (params->secret_len > NV_SCONE_GPU_LOCK_SECRET_MAX))
+    {
+        return -EINVAL;
+    }
+
+
+    if (uvm_global == NULL)
+        return -ENODEV;
+
+
+    uvm_mutex_lock(&uvm_global->global_lock);
+    if (uvm_global->scone_gpu_locked &&
+        !uvm_scone_gpu_lock_secret_matches_locked(uvm_global, params))
+    {
+        rc = -EBUSY;
+        goto done;
+    }
+    /* Should acquire the lock after the first open for uvm device  */
+    /* , otherwise it will fail.                                    */
+    else if (!uvm_global->scone_gpu_locked &&
+            atomic64_read(&uvm_global->open_counter) > 1)
+    {
+        pr_err("nvidia-uvm cannot be locked when open_counter >1 \n");
+        rc = -EBUSY;
+        goto done;
+    } 
+    
+    rc = uvm_scone_gpu_lock_add_current_thread_group_locked(uvm_global, params);
+
+done:
+    memzero_explicit(params->secret, sizeof(params->secret));
+    uvm_mutex_unlock(&uvm_global->global_lock);
+    return rc;
+}
+
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1044,6 +1202,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2,uvm_api_tools_get_processor_uuid_table_v2);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_ALLOC_DEVICE_P2P,               uvm_api_alloc_device_p2p);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CLEAR_ALL_ACCESS_COUNTERS,      uvm_api_clear_all_access_counters);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_LOCK_DRIVER,                    uvm_api_lock_driver);
     }
 
     // Try the test ioctls if none of the above matched

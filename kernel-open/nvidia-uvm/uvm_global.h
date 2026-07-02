@@ -165,6 +165,13 @@ struct uvm_global_struct
         struct list_head list;
     } pci_p2pdma_devices;
 
+
+    atomic64_t open_counter;
+    NvBool scone_gpu_locked;
+    NvU32 scone_gpu_lock_secret_len;
+    NvU8  scone_gpu_lock_secret[NV_SCONE_GPU_LOCK_SECRET_MAX];
+    struct list_head scone_gpu_lock_holders;
+    atomic64_t scone_gpu_locked_counter;
 };
 
 

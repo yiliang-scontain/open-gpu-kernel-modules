@@ -91,6 +91,7 @@ NV_STATUS uvm_global_init(void)
     uvm_mutex_init(&g_uvm_global.devmem_ranges.lock, UVM_LOCK_ORDER_LEAF);
     INIT_LIST_HEAD(&g_uvm_global.devmem_ranges.list);
     INIT_LIST_HEAD(&g_uvm_global.pci_p2pdma_devices.list);
+    INIT_LIST_HEAD(&g_uvm_global.scone_gpu_lock_holders);
 
     status = uvm_kvmalloc_init();
     if (status != NV_OK) {
@@ -252,6 +253,17 @@ void uvm_global_exit(void)
 
     uvm_assert_mutex_unlocked(&g_uvm_global.va_spaces.lock);
     UVM_ASSERT(list_empty(&g_uvm_global.va_spaces.list));
+
+    nv_scone_gpu_lock_holder_t *holder;
+    nv_scone_gpu_lock_holder_t *tmp;
+    if (!list_empty(&g_uvm_global.scone_gpu_lock_holders))
+    {
+        list_for_each_entry_safe(holder, tmp, &g_uvm_global.scone_gpu_lock_holders, entry)
+        {
+            list_del(&holder->entry);
+            NV_KFREE(holder, sizeof(*holder));
+        }
+    }
 
     uvm_thread_context_global_exit();
     uvm_kvmalloc_exit();
