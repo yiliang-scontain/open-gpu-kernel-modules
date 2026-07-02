@@ -155,4 +155,17 @@ typedef struct nv_ioctl_wait_open_complete
     NvU32 adapterStatus;
 } nv_ioctl_wait_open_complete_t;
 
+#define NV_SCONE_GPU_LOCK_VERSION 1
+#define NV_SCONE_GPU_LOCK_SECRET_MAX 256
+
+typedef struct nv_ioctl_scone_gpu_lock
+{
+    NvU32 version;
+    NvU32 flags;
+    NvU32 minor_number;
+    NvU32 secret_len;
+    NvU32 status;
+    NvU8  secret[NV_SCONE_GPU_LOCK_SECRET_MAX];
+} nv_ioctl_scone_gpu_lock_t;
+
 #endif

@@ -1013,6 +1013,20 @@ typedef struct
     NV_STATUS       rmStatus;                                                  // OUT
 } UVM_DISCARD_PARAMS;
 
+#define NV_SCONE_GPU_LOCK_VERSION 1
+#define NV_SCONE_GPU_LOCK_SECRET_MAX 256
+typedef struct
+{
+    NvU32      version;                                          // IN
+    NvU32      flags;                                            // IN
+    NvU32      secret_len;                                       // IN
+    NvU32      status;                                           // IN
+    NvU8       secret[NV_SCONE_GPU_LOCK_SECRET_MAX];             // IN
+    NV_STATUS               rmStatus;                            // OUT
+} UVM_LOCK_DRIVER_PARAMS;
+
+#define UVM_LOCK_DRIVER                                               UVM_IOCTL_BASE(85)
+
 //
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
