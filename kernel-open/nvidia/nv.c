@@ -1216,7 +1216,7 @@ static NvBool
 nv_scone_gpu_lock_current_process_can_open_locked(nv_linux_state_t *nvl, pid_t tgid)
 {
     /* Fixme: Should we allow any kernel threads to open the device? */
-    if (!nvl->scone_gpu_locked || current->flags & PF_KTHREAD)
+    if (!nvl->scone_gpu_locked || (current->flags & PF_KTHREAD && current->tgid == tgid))
         return NV_TRUE;
 
     return nv_scone_gpu_lock_find_holder_locked(nvl, tgid) != NULL;
@@ -1231,6 +1231,7 @@ nv_scone_gpu_lock_add_current_thread_group_locked
 {
     nv_scone_gpu_lock_holder_t *holder;
 
+    // pr_debug("TGID %d takes the lock with GPU minor number %d\n" ,current->tgid, nvl == &nv_ctl_device? 255: nvl->minor_num);
     holder = nv_scone_gpu_lock_find_holder_locked(nvl, current->tgid);
     if (holder != NULL)
     {
@@ -1250,6 +1251,7 @@ nv_scone_gpu_lock_add_current_thread_group_locked
         nvl->scone_gpu_lock_secret_len = params->secret_len;
         atomic64_set(&nvl->scone_gpu_locked_counter, 1);
         memcpy(nvl->scone_gpu_lock_secret, params->secret, params->secret_len);
+        // pr_debug("TGID %d takes the first lock with GPU minor number %d\n" ,current->tgid, nvl == &nv_ctl_device? 255: nvl->minor_num);
     }
 
     return 0;
@@ -1329,7 +1331,10 @@ nv_scone_gpu_lock_release(nv_linux_state_t *nvl)
     nv_scone_gpu_lock_holder_t *tmp;
     LOCK_NV_LINUX_DEVICES();
     down(&nvl->ldata_lock);
-    if (atomic64_dec_and_test(&nvl->scone_gpu_locked_counter))
+    bool release_lock = nvl->scone_gpu_locked;
+    // if (release_lock)
+    //     pr_debug("TGID %d releases the lock with GPU minor number %d, current counter is %lld\n" ,current->tgid, nvl == &nv_ctl_device? 255: nvl->minor_num, atomic64_read(&nvl->scone_gpu_locked_counter));
+    if (release_lock && atomic64_dec_and_test(&nvl->scone_gpu_locked_counter))
     {
         if (!list_empty(&nvl->scone_gpu_lock_holders))
         {
@@ -1895,13 +1900,8 @@ static int nv_open_device(nv_state_t *nv, nvidia_stack_t *sp, pid_t tgid)
     if (!nv_scone_gpu_lock_current_process_can_open_locked(nvl, tgid))
     {
         NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
-                      "open() not permitted: SCONE GPU lock is held by another process\n");
+                      "open() not permitted: TGID %d has not the SCONE GPU lock\n", tgid);
         return -EACCES;
-    }
-
-    if (nvl->scone_gpu_locked)
-    {
-        atomic64_inc(&nvl->scone_gpu_locked_counter);
     }
 
     nv_assert_not_in_gpu_exclusion_list(sp, nv);
@@ -2084,6 +2084,13 @@ nvidia_open(
         rc = nvidia_ctl_open(inode, file);
         if (rc != 0)
             goto failed;
+        down(&nv_ctl_device.ldata_lock);
+        if (nv_ctl_device.scone_gpu_locked)
+        {
+            atomic64_inc(&nv_ctl_device.scone_gpu_locked_counter);
+            // pr_debug("TGID %d opens the device with GPU minor number 255, current scone_gpu_locked_counter is %lld\n", current->tgid, atomic64_read(&nv_ctl_device.scone_gpu_locked_counter));
+        }
+        up(&nv_ctl_device.ldata_lock);
         return rc;
     }
 
@@ -2174,6 +2181,7 @@ nonblock_end:
 
     up_read(&nv_system_pm_lock);
 failed:
+
     if (rc != 0)
     {
         if (nvlfp != NULL)
@@ -2181,6 +2189,14 @@ failed:
             nv_free_file_private(nvlfp);
             NV_SET_FILE_PRIVATE(file, NULL);
         }
+    } else {
+        down(&nvl->ldata_lock);
+        if (nvl->scone_gpu_locked)
+        {
+            atomic64_inc(&nvl->scone_gpu_locked_counter);
+            // pr_debug("TGID %d opens the device with GPU minor number %d, current scone_gpu_locked_counter is %lld\n", current->tgid, nvl == &nv_ctl_device? 255: nvl->minor_num, atomic64_read(&nvl->scone_gpu_locked_counter));
+        }
+        up(&nvl->ldata_lock);
     }
 
     return rc;
@@ -2373,7 +2389,6 @@ nvidia_close_callback(
 
     nv = NV_STATE_PTR(nvl);
 
-    nv_scone_gpu_lock_release(nvl);
     rm_cleanup_file_private(sp, nv, &nvlfp->nvfp);
 
     down(&nvl->mmap_lock);
@@ -2452,6 +2467,10 @@ nvidia_close(
         return nvidia_ctl_close(inode, file);
     }
 
+    if (nvlfp->nvptr != NULL) 
+        nv_scone_gpu_lock_release(nvlfp->nvptr);
+    else 
+        pr_err("Close open failed device, skip releasing lock");
     NV_SET_FILE_PRIVATE(file, NULL);
 
     rc = nv_wait_open_complete_interruptible(nvlfp);
@@ -3385,6 +3404,7 @@ nvidia_ctl_open(
     down(&nvl->ldata_lock);
 
     if (!nv_scone_gpu_lock_current_process_can_open_locked(nvl, current->tgid)) {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "NVRM: nvidia_ctl_open: TGID %d has not the SCONE GPU lock, cannot open\n", current->tgid);
         up(&nvl->ldata_lock);
         return -EBUSY;
     }
