@@ -84,6 +84,7 @@ NV_STATUS uvm_global_init(void)
     UVM_ASSERT(uvm_thread_context_global_initialized());
 
     uvm_mutex_init(&g_uvm_global.global_lock, UVM_LOCK_ORDER_GLOBAL);
+    uvm_mutex_init(&g_uvm_global.scone_secret_lock, UVM_LOCK_ORDER_LEAF);
     uvm_init_rwsem(&g_uvm_global.pm.lock, UVM_LOCK_ORDER_GLOBAL_PM);
     uvm_spin_lock_irqsave_init(&g_uvm_global.gpu_table_lock, UVM_LOCK_ORDER_LEAF);
     uvm_mutex_init(&g_uvm_global.va_spaces.lock, UVM_LOCK_ORDER_VA_SPACES_LIST);

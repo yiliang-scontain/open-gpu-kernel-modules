@@ -79,6 +79,8 @@ struct uvm_global_struct
     // Lock protecting the global state
     uvm_mutex_t global_lock;
 
+    // Lock protecting the scone_gpu_lock_secret
+    uvm_mutex_t scone_secret_lock;
     struct
     {
         // Lock synchronizing user threads with power management activity

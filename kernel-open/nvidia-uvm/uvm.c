@@ -229,7 +229,7 @@ uvm_scone_gpu_lock_release(uvm_global_t *uvm_global)
     nv_scone_gpu_lock_holder_t *tmp;
 
     if (atomic64_dec_and_test(&uvm_global->open_counter)) {
-        uvm_mutex_lock(&uvm_global->global_lock);
+        uvm_mutex_lock(&uvm_global->scone_secret_lock);
         if (!list_empty(&uvm_global->scone_gpu_lock_holders))
         {
             list_for_each_entry_safe(holder, tmp, &uvm_global->scone_gpu_lock_holders, entry)
@@ -239,7 +239,7 @@ uvm_scone_gpu_lock_release(uvm_global_t *uvm_global)
             }
         }
         uvm_scone_gpu_lock_clear_locked(uvm_global);
-        uvm_mutex_unlock(&uvm_global->global_lock);
+        uvm_mutex_unlock(&uvm_global->scone_secret_lock);
     }
 }
 
@@ -258,11 +258,12 @@ static int uvm_open(struct inode *inode, struct file *filp)
     if (!mapping)
         return -ENOMEM;
 
-    uvm_mutex_lock(&g_uvm_global.global_lock);
+    uvm_mutex_lock(&g_uvm_global.scone_secret_lock);
     if (!uvm_scone_gpu_lock_current_process_can_open_locked(&g_uvm_global, current->tgid)) {
+        uvm_mutex_unlock(&g_uvm_global.scone_secret_lock);
         return -EBUSY;
     }
-    uvm_mutex_unlock(&g_uvm_global.global_lock);
+    uvm_mutex_unlock(&g_uvm_global.scone_secret_lock);
 
     // By default all struct files on the same inode share the same
     // address_space structure (the inode's) across all processes. This means
@@ -1125,7 +1126,7 @@ static NV_STATUS uvm_api_lock_driver(UVM_LOCK_DRIVER_PARAMS *params, struct file
         return -ENODEV;
 
 
-    uvm_mutex_lock(&uvm_global->global_lock);
+    uvm_mutex_lock(&uvm_global->scone_secret_lock);
     if (uvm_global->scone_gpu_locked &&
         !uvm_scone_gpu_lock_secret_matches_locked(uvm_global, params))
     {
@@ -1146,7 +1147,7 @@ static NV_STATUS uvm_api_lock_driver(UVM_LOCK_DRIVER_PARAMS *params, struct file
 
 done:
     memzero_explicit(params->secret, sizeof(params->secret));
-    uvm_mutex_unlock(&uvm_global->global_lock);
+    uvm_mutex_unlock(&uvm_global->scone_secret_lock);
     return rc;
 }
 
