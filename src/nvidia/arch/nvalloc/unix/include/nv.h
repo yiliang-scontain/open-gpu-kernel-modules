@@ -1044,6 +1044,7 @@ void      NV_API_CALL nv_control_soc_irqs        (nv_state_t *, NvBool bEnable);
 NV_STATUS NV_API_CALL nv_get_current_irq_priv_data(nv_state_t *, NvU32 *);
 
 NV_STATUS NV_API_CALL nv_acquire_fabric_mgmt_cap (int, int*);
+NV_STATUS NV_API_CALL nv_scone_register_fabric_manager(nv_file_private_t *);
 int       NV_API_CALL nv_cap_drv_init(void);
 void      NV_API_CALL nv_cap_drv_exit(void);
 NvBool    NV_API_CALL nv_is_gpu_accessible(nv_state_t *);

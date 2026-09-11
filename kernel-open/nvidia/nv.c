@@ -248,8 +248,15 @@ static unsigned int  nvidia_poll           (struct file *, poll_table *);
 static int           nvidia_ioctl          (struct inode *, struct file *, unsigned int, unsigned long);
 static long          nvidia_unlocked_ioctl (struct file *, unsigned int, unsigned long);
 
-static int           nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *, nv_linux_state_t * nvl, nv_state_t *nv);
+static int           nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *, nv_linux_state_t *, nv_state_t *, nv_linux_file_private_t *);
 static void          nv_scone_gpu_lock_release(nv_linux_state_t *nvl);
+static NvBool        nv_scone_current_is_fabric_manager(void);
+static void          nv_scone_unregister_fabric_manager(nv_linux_file_private_t *nvlfp);
+
+// There can be only one validated Fabric Manager session system-wide. Keep a
+// reference to its thread-group leader so PID reuse cannot inherit the role.
+static DEFINE_SPINLOCK(nv_scone_fabric_manager_lock);
+static struct pid *nv_scone_fabric_manager_tgid;
 
 /* character device entry points*/
 static struct file_operations nvidia_fops = {
@@ -1095,12 +1102,106 @@ static void *nv_alloc_file_private(void)
     return nvlfp;
 }
 
+static NvBool nv_scone_current_is_fabric_manager(void)
+{
+    unsigned long flags;
+    NvBool is_fabric_manager;
+
+    spin_lock_irqsave(&nv_scone_fabric_manager_lock, flags);
+    is_fabric_manager = nv_scone_fabric_manager_tgid != NULL &&
+                        nv_scone_fabric_manager_tgid == task_pid(current->group_leader);
+    spin_unlock_irqrestore(&nv_scone_fabric_manager_lock, flags);
+
+    return is_fabric_manager;
+}
+
+NV_STATUS NV_API_CALL nv_scone_register_fabric_manager(nv_file_private_t *nvfp)
+{
+    nv_linux_file_private_t *nvlfp;
+    struct pid *tgid;
+    unsigned long flags;
+    NV_STATUS status = NV_OK;
+
+    if (nvfp == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    nvlfp = nv_get_nvlfp_from_nvfp(nvfp);
+    if (nvlfp->nvptr != &nv_ctl_device)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    tgid = get_pid(task_pid(current->group_leader));
+
+    // Serialize registration against activation of the control-device lock.
+    down(&nv_ctl_device.ldata_lock);
+    if (nv_ctl_device.scone_gpu_locked)
+    {
+        status = NV_ERR_STATE_IN_USE;
+        goto done;
+    }
+
+    spin_lock_irqsave(&nv_scone_fabric_manager_lock, flags);
+    if (nv_scone_fabric_manager_tgid != NULL &&
+        nv_scone_fabric_manager_tgid != tgid)
+    {
+        status = NV_ERR_STATE_IN_USE;
+    }
+    else
+    {
+        if (nv_scone_fabric_manager_tgid == NULL)
+        {
+            nv_scone_fabric_manager_tgid = tgid;
+            tgid = NULL;
+        }
+
+        nvlfp->scone_fabric_manager = NV_TRUE;
+        nvlfp->scone_fabric_manager_owner = NV_TRUE;
+        if (!nvlfp->scone_fabric_manager_ref_held)
+        {
+            atomic64_inc(&nv_ctl_device.scone_fabric_manager_open_counter);
+            nvlfp->scone_fabric_manager_ref_held = NV_TRUE;
+        }
+    }
+    spin_unlock_irqrestore(&nv_scone_fabric_manager_lock, flags);
+
+done:
+    up(&nv_ctl_device.ldata_lock);
+    if (tgid != NULL)
+        put_pid(tgid);
+
+    return status;
+}
+
+static void nv_scone_unregister_fabric_manager(nv_linux_file_private_t *nvlfp)
+{
+    struct pid *tgid = NULL;
+    unsigned long flags;
+
+    if (!nvlfp->scone_fabric_manager_owner)
+        return;
+
+    spin_lock_irqsave(&nv_scone_fabric_manager_lock, flags);
+    tgid = nv_scone_fabric_manager_tgid;
+    nv_scone_fabric_manager_tgid = NULL;
+    nvlfp->scone_fabric_manager_owner = NV_FALSE;
+    spin_unlock_irqrestore(&nv_scone_fabric_manager_lock, flags);
+
+    if (tgid != NULL)
+        put_pid(tgid);
+}
+
 static void nv_free_file_private(nv_linux_file_private_t *nvlfp)
 {
     nvidia_event_t *nvet;
 
     if (nvlfp == NULL)
         return;
+
+    if (nvlfp->scone_fabric_manager_ref_held)
+    {
+        atomic64_dec(&nvlfp->nvptr->scone_fabric_manager_open_counter);
+        nvlfp->scone_fabric_manager_ref_held = NV_FALSE;
+    }
+    nv_scone_unregister_fabric_manager(nvlfp);
 
     for (nvet = nvlfp->event_data_head; nvet != NULL; nvet = nvlfp->event_data_head)
     {
@@ -1258,10 +1359,14 @@ nv_scone_gpu_lock_add_current_thread_group_locked
 }
 
 static int
-nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *params, nv_linux_state_t * nvl, nv_state_t *nv)
+nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *params,
+                        nv_linux_state_t *nvl,
+                        nv_state_t *nv,
+                        nv_linux_file_private_t *nvlfp)
 {
     int rc = 0;
     bool is_ctl_device = false;
+    bool was_locked;
 
     if ((params->version != NV_SCONE_GPU_LOCK_VERSION) ||
         (params->flags != 0) ||
@@ -1286,6 +1391,7 @@ nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *params, nv_linux_state_t * nv
     }
 
     down(&nvl->ldata_lock);
+    was_locked = nvl->scone_gpu_locked;
 
     if (nvl->scone_gpu_locked &&
         !nv_scone_gpu_lock_secret_matches_locked(nvl, params))
@@ -1298,25 +1404,58 @@ nv_scone_gpu_lock_ioctl(nv_ioctl_scone_gpu_lock_t *params, nv_linux_state_t * nv
     else if (!nvl->scone_gpu_locked)
                 
     {
-        int usage_count = atomic64_read(&nvl->usage_count);
-        if (is_ctl_device && usage_count > 1)
+        NvS64 usage_count = atomic64_read(&nvl->usage_count);
+        NvS64 fm_open_count = atomic64_read(&nvl->scone_fabric_manager_open_counter);
+        NvS64 protected_usage_count = usage_count - fm_open_count;
+        NvS64 allowed_usage_count = is_ctl_device ? 1 : 2;
+
+        //
+        // usage_count includes more than direct userspace file descriptors.
+        // In particular, NV_ESC_ATTACH_GPUS_TO_FD holds references through
+        // nvidia_dev_get() until the associated control file is closed. Log
+        // every first-lock check so untagged Fabric Manager references can be
+        // diagnosed even when the lock happens to remain below the limit.
+        //
+        pr_info("NVRM: SCONE lock check: minor=%u requester_tgid=%d "
+                "total_refs=%lld tagged_fm_refs=%lld non_fm_refs=%lld "
+                "allowed_non_fm_refs=%lld\n",
+                params->minor_number, current->tgid, usage_count,
+                fm_open_count, protected_usage_count, allowed_usage_count);
+
+        if (protected_usage_count < 0)
+        {
+            pr_err("NVRM: SCONE lock accounting error: tagged Fabric Manager "
+                   "references exceed total references\n");
+            rc = -EIO;
+            goto done;
+        }
+
+        if (is_ctl_device && protected_usage_count > 1)
         {
             pr_err("nvidiactl cannot be locked when opened by others!\n");
-            pr_err("current usage_count is %d\n", usage_count);
+            pr_err("current usage_count is %lld (%lld Fabric Manager)\n",
+                   usage_count, fm_open_count);
             rc = -EBUSY;
             goto done;
         }
 
-        if (!is_ctl_device && usage_count > 2)
+        if (!is_ctl_device && protected_usage_count > 2)
         {
             pr_err("nvidia device cannot be locked when opened by no kernel threads!\n");
-            pr_err("current usage_count is %d\n", usage_count);
+            pr_err("current usage_count is %lld (%lld Fabric Manager)\n",
+                   usage_count, fm_open_count);
             rc = -EBUSY;
             goto done;
         }
     } 
     
     rc = nv_scone_gpu_lock_add_current_thread_group_locked(nvl, params);
+    if (rc == 0 && !nvlfp->scone_gpu_lock_ref_held)
+    {
+        if (was_locked)
+            atomic64_inc(&nvl->scone_gpu_locked_counter);
+        nvlfp->scone_gpu_lock_ref_held = NV_TRUE;
+    }
 
 done:
     memzero_explicit(params->secret, sizeof(params->secret));
@@ -1929,6 +2068,18 @@ static void nv_add_open_file(nv_linux_state_t *nvl,
 {
     nvlfp->nvptr = nvl;
 
+    if (nvlfp->scone_fabric_manager && !nvlfp->scone_fabric_manager_ref_held)
+    {
+        atomic64_inc(&nvl->scone_fabric_manager_open_counter);
+        nvlfp->scone_fabric_manager_ref_held = NV_TRUE;
+    }
+
+    if (nvl->scone_gpu_locked && !nvlfp->scone_gpu_lock_ref_held)
+    {
+        atomic64_inc(&nvl->scone_gpu_locked_counter);
+        nvlfp->scone_gpu_lock_ref_held = NV_TRUE;
+    }
+
     /*
      * nvl->open_files and other mapping revocation members in nv_linux_state_t
      * are protected by nvl->mmap_lock instead of nvl->ldata_lock.
@@ -2076,6 +2227,8 @@ nvidia_open(
 
     NV_SET_FILE_PRIVATE(file, nvlfp);
     nvlfp->sp = sp;
+    nvlfp->tgid = current->tgid;
+    nvlfp->scone_fabric_manager = nv_scone_current_is_fabric_manager();
 
     /* for control device, just jump to its open routine */
     /* after setting up the private data */
@@ -2085,9 +2238,15 @@ nvidia_open(
         if (rc != 0)
             goto failed;
         down(&nv_ctl_device.ldata_lock);
+        if (nvlfp->scone_fabric_manager)
+        {
+            atomic64_inc(&nv_ctl_device.scone_fabric_manager_open_counter);
+            nvlfp->scone_fabric_manager_ref_held = NV_TRUE;
+        }
         if (nv_ctl_device.scone_gpu_locked)
         {
             atomic64_inc(&nv_ctl_device.scone_gpu_locked_counter);
+            nvlfp->scone_gpu_lock_ref_held = NV_TRUE;
             // pr_debug("TGID %d opens the device with GPU minor number 255, current scone_gpu_locked_counter is %lld\n", current->tgid, atomic64_read(&nv_ctl_device.scone_gpu_locked_counter));
         }
         up(&nv_ctl_device.ldata_lock);
@@ -2116,10 +2275,6 @@ nvidia_open(
 
     nv = NV_STATE_PTR(nvl);
     nv_init_mapping_revocation(nvl, file, nvlfp, inode);
-
-    /* The open of device can be deferred to a kernel thread */
-    /* Record the real tgid to clearify ownership            */
-    nvlfp->tgid = current->tgid;
 
     if (nv_try_lock_foreground_open(file, nvl) == 0)
     {
@@ -2181,7 +2336,6 @@ nonblock_end:
 
     up_read(&nv_system_pm_lock);
 failed:
-
     if (rc != 0)
     {
         if (nvlfp != NULL)
@@ -2189,14 +2343,6 @@ failed:
             nv_free_file_private(nvlfp);
             NV_SET_FILE_PRIVATE(file, NULL);
         }
-    } else {
-        down(&nvl->ldata_lock);
-        if (nvl->scone_gpu_locked)
-        {
-            atomic64_inc(&nvl->scone_gpu_locked_counter);
-            // pr_debug("TGID %d opens the device with GPU minor number %d, current scone_gpu_locked_counter is %lld\n", current->tgid, nvl == &nv_ctl_device? 255: nvl->minor_num, atomic64_read(&nvl->scone_gpu_locked_counter));
-        }
-        up(&nvl->ldata_lock);
     }
 
     return rc;
@@ -2389,6 +2535,12 @@ nvidia_close_callback(
 
     nv = NV_STATE_PTR(nvl);
 
+    if (nvlfp->scone_gpu_lock_ref_held)
+    {
+        nvlfp->scone_gpu_lock_ref_held = NV_FALSE;
+        nv_scone_gpu_lock_release(nvl);
+    }
+
     rm_cleanup_file_private(sp, nv, &nvlfp->nvfp);
 
     down(&nvl->mmap_lock);
@@ -2467,10 +2619,6 @@ nvidia_close(
         return nvidia_ctl_close(inode, file);
     }
 
-    if (nvlfp->nvptr != NULL) 
-        nv_scone_gpu_lock_release(nvlfp->nvptr);
-    else 
-        pr_err("Close open failed device, skip releasing lock");
     NV_SET_FILE_PRIVATE(file, NULL);
 
     rc = nv_wait_open_complete_interruptible(nvlfp);
@@ -2952,7 +3100,7 @@ nvidia_ioctl(
                 goto done;
             }
 
-            status = nv_scone_gpu_lock_ioctl(params, nvl, nv);
+            status = nv_scone_gpu_lock_ioctl(params, nvl, nv, nvlfp);
             break;
         }
 
@@ -3448,7 +3596,11 @@ nvidia_ctl_close(
     }
     up(&nvl->ldata_lock);
 
-    nv_scone_gpu_lock_release(nvl);
+    if (nvlfp->scone_gpu_lock_ref_held)
+    {
+        nvlfp->scone_gpu_lock_ref_held = NV_FALSE;
+        nv_scone_gpu_lock_release(nvl);
+    }
     rm_cleanup_file_private(sp, nv, &nvlfp->nvfp);
 
     // Populate free list from file nodes
@@ -4303,6 +4455,7 @@ NvBool nv_lock_init_locks
     NV_INIT_MUTEX(&nvl->open_q_lock);
 
     atomic64_set(&nvl->usage_count, 0);
+    atomic64_set(&nvl->scone_fabric_manager_open_counter, 0);
     INIT_LIST_HEAD(&nvl->scone_gpu_lock_holders);
 
     if (!rm_init_event_locks(sp, nv))

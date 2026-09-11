@@ -28,6 +28,7 @@
  */
 
 #include "core/core.h"
+#include "nv.h"
 #include "os/os.h"
 #include "compute/fm_session_api.h"
 #include "class/cl000f.h"
@@ -161,6 +162,22 @@ fmsessionapiConstruct_IMPL
     {
          NV_PRINTF(LEVEL_ERROR, "Capability validation failed\n");
          return status;
+    }
+
+    //
+    // The capability check above is the authoritative identification of the
+    // Fabric Manager. Tell the Linux layer that this file belongs to FM so
+    // that an already-running FM does not prevent a later SCONE lock from
+    // being established. This does not grant FM the SCONE secret and does not
+    // allow FM to join an already-established SCONE lock.
+    //
+    status = nv_scone_register_fabric_manager(pRmClient->pOSInfo);
+    if (status != NV_OK)
+    {
+        osRmCapRelease(pFmSessionApi->dupedCapDescriptor);
+        osRmCapInitDescriptor(&pFmSessionApi->dupedCapDescriptor);
+        NV_PRINTF(LEVEL_ERROR, "Failed to register Fabric Manager with the SCONE GPU lock\n");
+        return status;
     }
 
     if (pFabric != NULL)

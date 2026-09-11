@@ -1260,6 +1260,7 @@ typedef struct nv_linux_state_s {
     NvU8  scone_gpu_lock_secret[NV_SCONE_GPU_LOCK_SECRET_MAX];
     struct list_head scone_gpu_lock_holders;
     atomic64_t scone_gpu_locked_counter;
+    atomic64_t scone_fabric_manager_open_counter;
 
     NvU32    suspend_count;
 
@@ -1515,6 +1516,10 @@ typedef struct
     nv_linux_state_t *deferred_open_nvl;
     int open_rc;
     pid_t tgid;
+    NvBool scone_fabric_manager;
+    NvBool scone_fabric_manager_owner;
+    NvBool scone_fabric_manager_ref_held;
+    NvBool scone_gpu_lock_ref_held;
     NV_STATUS adapter_status;
 
     struct list_head entry;
