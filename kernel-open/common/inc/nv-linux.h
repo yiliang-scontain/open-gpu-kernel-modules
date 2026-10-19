@@ -26,6 +26,7 @@
 
 #include "nvstatus.h"
 #include "nv.h"
+#include "nv-scone.h"
 #include "nv-ioctl-numa.h"
 #include "conftest.h"
 
@@ -1497,8 +1498,8 @@ typedef struct
     nv_kthread_q_item_t deferred_close_q_item;
     NvU32 *attached_gpus;
     size_t num_attached_gpus;
-    NvBool *scone_gpu_host_leases;
-    NvBool scone_gpu_host_lease;
+    nv_scone_gpu_lease_token_t *scone_gpu_lease_tokens;
+    nv_scone_gpu_lease_token_t scone_gpu_lease_token;
     nv_linux_state_t *scone_gpu_lease_nvl;
     struct address_space mapping;
 

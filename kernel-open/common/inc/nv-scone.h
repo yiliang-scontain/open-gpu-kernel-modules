@@ -10,6 +10,20 @@
 
 struct nv_state_t;
 
+typedef struct
+{
+    NvU64 assignment_generation;
+    NvU64 member_id;
+} nv_scone_gpu_lease_token_t;
+
+static inline NvBool nv_scone_gpu_lease_token_valid(
+    const nv_scone_gpu_lease_token_t *token
+)
+{
+    return (token != NULL) &&
+           ((token->assignment_generation != 0) || (token->member_id != 0));
+}
+
 /* Keep these values synchronized with enum gpu_security_operation. */
 enum nv_scone_gpu_operation {
     NV_SCONE_GPU_OPERATION_DISCOVER = 1,
@@ -26,13 +40,13 @@ NV_STATUS NV_API_CALL nv_scone_gpu_authorize(struct nv_state_t *nv,
 NV_STATUS NV_API_CALL nv_scone_gpu_authorize_uuid(const NvU8 *uuid,
                                                    NvU32 operation);
 NV_STATUS NV_API_CALL nv_scone_gpu_acquire(struct nv_state_t *nv,
-                                           NvBool *host_lease);
+                                           nv_scone_gpu_lease_token_t *token);
 NV_STATUS NV_API_CALL nv_scone_gpu_acquire_uuid(const NvU8 *uuid,
-                                                NvBool *host_lease);
+                                                nv_scone_gpu_lease_token_t *token);
 void NV_API_CALL nv_scone_gpu_release(struct nv_state_t *nv,
-                                      NvBool host_lease);
+                                      const nv_scone_gpu_lease_token_t *token);
 void NV_API_CALL nv_scone_gpu_release_uuid(const NvU8 *uuid,
-                                           NvBool host_lease);
+                                           const nv_scone_gpu_lease_token_t *token);
 NvBool NV_API_CALL nv_scone_gpu_exclusive_enabled(void);
 
 #endif /* __NV_SCONE_H__ */

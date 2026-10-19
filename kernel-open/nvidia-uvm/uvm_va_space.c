@@ -460,7 +460,8 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     uvm_gpu_t *gpu;
     uvm_gpu_id_t gpu_id;
     uvm_processor_mask_t *retained_gpus = &va_space->registered_gpus_teardown;
-    uvm_processor_mask_t *host_leases = &va_space->scone_host_leases_teardown;
+    nv_scone_gpu_lease_token_t *lease_tokens =
+        va_space->scone_gpu_lease_tokens_teardown;
     LIST_HEAD(deferred_free_list);
 
     // Remove the VA space from the global list before we start tearing things
@@ -489,8 +490,10 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     uvm_va_space_down_write(va_space);
 
     uvm_processor_mask_copy(retained_gpus, &va_space->registered_gpus);
-    uvm_processor_mask_copy(host_leases, &va_space->scone_host_leases);
-    uvm_processor_mask_zero(&va_space->scone_host_leases);
+    memcpy(lease_tokens, va_space->scone_gpu_lease_tokens,
+           sizeof(va_space->scone_gpu_lease_tokens));
+    memset(va_space->scone_gpu_lease_tokens, 0,
+           sizeof(va_space->scone_gpu_lease_tokens));
 
     bitmap_copy(va_space->enabled_peers_teardown, va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 
@@ -614,10 +617,10 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
             }
         }
 
-        if (uvm_processor_mask_test(host_leases, gpu_id)) {
-            nv_scone_gpu_release_uuid(gpu->uuid.uuid, NV_TRUE);
-            uvm_processor_mask_clear(host_leases, gpu_id);
-        }
+        nv_scone_gpu_release_uuid(
+            gpu->uuid.uuid, &lease_tokens[uvm_id_value(gpu_id)]);
+        memset(&lease_tokens[uvm_id_value(gpu_id)], 0,
+               sizeof(lease_tokens[uvm_id_value(gpu_id)]));
 
         uvm_gpu_release_locked(gpu);
     }
@@ -751,15 +754,15 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
     bool gpu_can_access_sysmem = true;
     uvm_processor_mask_t *peers_to_release = NULL;
     bool enable_hmm = !(va_space->initialization_flags & UVM_INIT_FLAGS_DISABLE_HMM);
-    NvBool host_lease = NV_FALSE;
+    nv_scone_gpu_lease_token_t lease_token = {};
 
-    status = nv_scone_gpu_acquire_uuid(gpu_uuid->uuid, &host_lease);
+    status = nv_scone_gpu_acquire_uuid(gpu_uuid->uuid, &lease_token);
     if (status != NV_OK)
         return status;
 
     status = uvm_gpu_retain_by_uuid(gpu_uuid, user_rm_device, &va_space->test.parent_gpu_error, enable_hmm, &gpu);
     if (status != NV_OK) {
-        nv_scone_gpu_release_uuid(gpu_uuid->uuid, host_lease);
+        nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
         return status;
     }
 
@@ -775,7 +778,7 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
         status = uvm_gpu_access_counters_enable(gpu, va_space);
         if (status != NV_OK) {
             uvm_gpu_release(gpu);
-            nv_scone_gpu_release_uuid(gpu_uuid->uuid, host_lease);
+            nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
             return status;
         }
     }
@@ -933,8 +936,7 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
     else
         uvm_va_space_ats_set(va_space, UVM_ATS_VA_SPACE_ATS_UNSUPPORTED);
 
-    if (host_lease)
-        uvm_processor_mask_set(&va_space->scone_host_leases, gpu->id);
+    va_space->scone_gpu_lease_tokens[uvm_id_value(gpu->id)] = lease_token;
 
     goto done;
 
@@ -961,7 +963,7 @@ done:
             uvm_gpu_access_counters_disable(gpu, va_space);
 
         uvm_gpu_release(gpu);
-        nv_scone_gpu_release_uuid(gpu_uuid->uuid, host_lease);
+        nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
     }
 
     return status;
@@ -976,7 +978,7 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     uvm_processor_mask_t *peers_to_release;
     LIST_HEAD(deferred_free_list);
     bool disable_access_counters = false;
-    bool host_lease;
+    nv_scone_gpu_lease_token_t lease_token;
 
     // Stopping channels requires holding the VA space lock in read mode, so do
     // it first. We start in write mode then drop to read in order to flush out
@@ -1046,8 +1048,10 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     // We blocked out other GPU unregisters, so this GPU must still be
     // registered. However, the GPU VA space might have been unregistered on us.
     UVM_ASSERT(uvm_processor_mask_test(&va_space->registered_gpus, gpu->id));
-    host_lease = uvm_processor_mask_test(&va_space->scone_host_leases, gpu->id);
-    uvm_processor_mask_clear(&va_space->scone_host_leases, gpu->id);
+    lease_token =
+        va_space->scone_gpu_lease_tokens[uvm_id_value(gpu->id)];
+    memset(&va_space->scone_gpu_lease_tokens[uvm_id_value(gpu->id)], 0,
+           sizeof(va_space->scone_gpu_lease_tokens[uvm_id_value(gpu->id)]));
     if (uvm_processor_mask_test(&va_space->registered_gpu_va_spaces, gpu->id))
         UVM_ASSERT(uvm_gpu_va_space_get(va_space, gpu) == gpu_va_space);
 
@@ -1087,8 +1091,7 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
 
     uvm_processor_mask_cache_free(peers_to_release);
 
-    nv_scone_gpu_release_uuid(gpu_uuid->uuid,
-                              host_lease ? NV_TRUE : NV_FALSE);
+    nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
 
     uvm_gpu_release_locked(gpu);
 
