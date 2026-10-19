@@ -25,6 +25,14 @@ NV_STATUS NV_API_CALL nv_scone_gpu_authorize(struct nv_state_t *nv,
                                               NvU32 operation);
 NV_STATUS NV_API_CALL nv_scone_gpu_authorize_uuid(const NvU8 *uuid,
                                                    NvU32 operation);
+NV_STATUS NV_API_CALL nv_scone_gpu_acquire(struct nv_state_t *nv,
+                                           NvBool *host_lease);
+NV_STATUS NV_API_CALL nv_scone_gpu_acquire_uuid(const NvU8 *uuid,
+                                                NvBool *host_lease);
+void NV_API_CALL nv_scone_gpu_release(struct nv_state_t *nv,
+                                      NvBool host_lease);
+void NV_API_CALL nv_scone_gpu_release_uuid(const NvU8 *uuid,
+                                           NvBool host_lease);
 NvBool NV_API_CALL nv_scone_gpu_exclusive_enabled(void);
 
 #endif /* __NV_SCONE_H__ */

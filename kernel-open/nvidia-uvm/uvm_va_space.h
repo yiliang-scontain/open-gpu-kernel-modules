@@ -188,6 +188,9 @@ struct uvm_va_space_struct
     // Mask of gpus registered with the va space
     uvm_processor_mask_t registered_gpus;
 
+    // Host leases held until GPU unregister or complete VA-space teardown.
+    uvm_processor_mask_t scone_host_leases;
+
     // Count of integrated GPUs in a VA space.
     NvU32 num_integrated_gpus;
 
@@ -287,6 +290,7 @@ struct uvm_va_space_struct
     // Temporary copy of registered_gpus used to avoid allocation during VA
     // space destroy.
     uvm_processor_mask_t registered_gpus_teardown;
+    uvm_processor_mask_t scone_host_leases_teardown;
 
     // Allocated in uvm_va_space_register_gpu(), used and free'd in
     // uvm_va_space_unregister_gpu().

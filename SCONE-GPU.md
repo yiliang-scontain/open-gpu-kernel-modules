@@ -45,6 +45,12 @@ that cannot be attributed to one admitted GPU.  Adding or regenerating an RM
 root control requires classifying it as target-resolved, filtered discovery,
 or denied global state before it can be enabled.
 
+Ordinary host clients hold a per-GPU lease from physical-device open or RM/UVM
+attachment through completed driver teardown.  TD admission fails while any
+host lease exists.  The lease is deliberately released from NVIDIA's actual
+close or VA-space destruction path, not the VFS file release path, because
+both core RM and UVM can defer teardown to driver kernel threads.
+
 ## Security assumptions and unsupported configurations
 
 The patch implements physical, whole-GPU ownership.  MIG, vGPU, display,
