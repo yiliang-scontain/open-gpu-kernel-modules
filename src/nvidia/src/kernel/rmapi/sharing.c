@@ -21,6 +21,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 #include "rmapi/rmapi.h"
+#include "nv-scone.h"
 #include "rmapi/rmapi_utils.h"
 #include "entry_points.h"
 #include "core/thread_state.h"
@@ -102,6 +103,10 @@ rmapiDupObjectWithSecInfo
     NV_STATUS status;
     RM_API_CONTEXT rmApiContext = {0};
     RS_LOCK_INFO lockInfo;
+
+    if ((pSecInfo->paramLocation == PARAM_LOCATION_USER) &&
+        (hClient != hClientSrc) && nv_scone_gpu_exclusive_enabled())
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
 
     NV_PRINTF(LEVEL_INFO,
               "Nv04DupObject: hClient:0x%x hParent:0x%x hObject:0x%x\n",
@@ -225,6 +230,10 @@ rmapiShareWithSecInfo
     RM_API_CONTEXT rmApiContext = {0};
     RS_LOCK_INFO lockInfo;
     NvHandle hSecondClient = NV01_NULL_OBJECT;
+
+    if ((pSecInfo->paramLocation == PARAM_LOCATION_USER) &&
+        nv_scone_gpu_exclusive_enabled())
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
 
     NV_PRINTF(LEVEL_INFO,
               "Nv04Share: hClient:0x%x hObject:0x%x pSharePolicy:%p\n",

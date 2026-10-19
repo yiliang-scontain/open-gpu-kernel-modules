@@ -38,6 +38,7 @@
 #include <osapi.h>
 #include <rmapi/exports.h>
 #include <nv-unix-nvos-params-wrappers.h>
+#include <nv-scone.h>
 
 #include <nvos.h>
 #include <class/cl0000.h> // NV01_ROOT
@@ -773,6 +774,13 @@ NV_STATUS RmIoctl(
             if (pNv == NULL)
             {
                 rmStatus = NV_ERR_INVALID_ARGUMENT;
+                goto done;
+            }
+
+            if (nv_scone_gpu_authorize(
+                    pNv, NV_SCONE_GPU_OPERATION_DISCOVER) != NV_OK)
+            {
+                rmStatus = NV_ERR_INSUFFICIENT_PERMISSIONS;
                 goto done;
             }
 

@@ -1437,6 +1437,9 @@ typedef struct nv_linux_state_s {
 
     /* Per-device GPU init on probe setting, initialized from global NVreg_GpuInitOnProbe */
     NvBool init_on_probe;
+
+    /* True after the physical minor has been registered with SCONE. */
+    NvBool scone_gpu_registered;
 } nv_linux_state_t;
 
 extern nv_linux_state_t *nv_linux_devices;

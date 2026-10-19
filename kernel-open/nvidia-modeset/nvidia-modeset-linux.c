@@ -2085,6 +2085,12 @@ static int __init nvkms_init(void)
 {
     int ret;
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    printk(KERN_ERR NVKMS_LOG_PREFIX
+           "disabled by SCONE exclusive whole-GPU admission\n");
+    return -EOPNOTSUPP;
+#endif
+
     atomic_set(&nvkms_alloc_called_count, 0);
 
 #if defined(NVKMS_NVHOST_SYNCPT_SUPPORTED)

@@ -92,6 +92,8 @@ NvBool        nv_lock_init_locks(nvidia_stack_t *, nv_state_t *);
 void          nv_lock_destroy_locks(nvidia_stack_t *, nv_state_t *);
 void          nv_linux_add_device_locked(nv_linux_state_t *);
 int           nv_linux_assign_minor_locked(nv_linux_state_t *);
+int           nv_scone_gpu_register_device(nv_linux_state_t *);
+void          nv_scone_gpu_unregister_device(nv_linux_state_t *);
 void          nv_linux_remove_minor_locked(nv_linux_state_t *);
 void          nv_linux_remove_device_locked(nv_linux_state_t *);
 NvBool        nv_acpi_power_resource_method_present(struct pci_dev *);

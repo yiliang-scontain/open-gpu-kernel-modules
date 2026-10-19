@@ -38,6 +38,7 @@
 #include "rmapi/rmapi_specific.h"
 #include "rmapi/rmapi_utils.h"
 #include "kernel/gpu/gsp/gsp_trace_rats_macro.h"
+#include "nv-scone.h"
 
 #include "ctrl/ctrl0000/ctrl0000gpuacct.h" // NV0000_CTRL_CMD_GPUACCT_*
 #include "ctrl/ctrl2080/ctrl2080tmr.h" // NV2080_CTRL_CMD_TIMER_SCHEDULE
@@ -786,6 +787,13 @@ NV_STATUS serverControl_ValidateCookie
     // confirm command is on allowlist for target gpu
     if (pRmCtrlParams->pGpu != NULL)
     {
+        if ((pRmCtrlParams->secInfo.paramLocation == PARAM_LOCATION_USER) &&
+            (nv_scone_gpu_authorize(pRmCtrlParams->pGpu->pOsGpuInfo,
+                                    NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK))
+        {
+            return NV_ERR_INSUFFICIENT_PERMISSIONS;
+        }
+
         status = gpuValidateRmctrlCmd_HAL(pRmCtrlParams->pGpu, pRmCtrlParams->cmd);
         if (status != NV_OK)
         {
@@ -1155,4 +1163,3 @@ rmapiControlWithSecInfoTls
 
     return status;
 }
-

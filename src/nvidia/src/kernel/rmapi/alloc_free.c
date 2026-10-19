@@ -42,6 +42,7 @@
 #include "gpu/device/device.h"
 #include "class/cl0080.h"
 #include "class/clc372sw.h"
+#include "nv-scone.h"
 
 #include "class/cl83de.h" // GT200_DEBUGGER
 #include "gpu/gr/kernel_sm_debugger_session.h"
@@ -1396,6 +1397,14 @@ resservResourceFactory
     {
         NV_PRINTF(LEVEL_INFO, "Skipping unsupported class 0x%x\n", pParams->externalClassId);
         return NV_ERR_NOT_SUPPORTED;
+    }
+
+    if ((pGpu != NULL) &&
+        (pCallContext->secInfo.paramLocation == PARAM_LOCATION_USER) &&
+        (nv_scone_gpu_authorize(pGpu->pOsGpuInfo,
+                                NV_SCONE_GPU_OPERATION_COMPUTE) != NV_OK))
+    {
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
     }
 
     if (pGpu != NULL)

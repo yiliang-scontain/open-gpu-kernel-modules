@@ -640,6 +640,10 @@ static int nv_mem_param_persistent_api_conf_check(void)
 
 static int __init nv_mem_client_init(void)
 {
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    pr_err("nvidia-peermem: disabled by SCONE exclusive whole-GPU admission\n");
+    return -EOPNOTSUPP;
+#endif
 #if defined (NV_MLNX_IB_PEER_MEM_SYMBOLS_PRESENT)
     int rc;
     rc = nv_mem_param_peerdirect_conf_check();

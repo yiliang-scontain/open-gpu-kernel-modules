@@ -55,6 +55,12 @@
 #include "nv-pat.h"
 #include "nv-dmabuf.h"
 #include "nv-caps-imex.h"
+#include "nv-scone.h"
+
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+#include <linux/scone_domain_gpu.h>
+#include <linux/security.h>
+#endif
 
 /*
  * Commit aefb2f2e619b ("x86/bugs: Rename CONFIG_RETPOLINE =>
@@ -995,17 +1001,35 @@ static int __init nvidia_init_module(void)
         goto drivers_exit;
     }
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    rc = security_gpu_device_register(
+            MKDEV(NV_MAJOR_DEVICE_NUMBER,
+                  NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE),
+            GPU_SECURITY_DEVICE_CONTROL, NULL);
+    if (rc < 0)
+    {
+        goto partial_chrdev_exit;
+    }
+#endif
+
     rc = nv_register_chrdev(NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE, 1,
             &nv_linux_control_device_cdev, "nvidiactl", &nvidia_fops);
     if (rc < 0)
     {
-        goto partial_chrdev_exit;
+        goto control_security_exit;
     }
 
     __nv_init_sp = sp;
 
     return 0;
 
+control_security_exit:
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(
+        MKDEV(NV_MAJOR_DEVICE_NUMBER,
+              NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE),
+        GPU_SECURITY_DEVICE_CONTROL);
+#endif
 partial_chrdev_exit:
     nv_unregister_chrdev(0, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1,
         &nv_linux_devices_cdev);
@@ -1045,6 +1069,12 @@ static void __exit nvidia_exit_module(void)
 {
     nvidia_stack_t *sp = __nv_init_sp;
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(
+        MKDEV(NV_MAJOR_DEVICE_NUMBER,
+              NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE),
+        GPU_SECURITY_DEVICE_CONTROL);
+#endif
     nv_unregister_chrdev(NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE, 1,
         &nv_linux_control_device_cdev);
     nv_unregister_chrdev(0, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1,
@@ -1191,6 +1221,119 @@ static nv_linux_state_t *find_gpu_id(NvU32 gpu_id)
     return nvl;
 }
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+static int nv_scone_gpu_identity(
+    nv_state_t *nv,
+    struct gpu_security_identity *identity
+)
+{
+    nv_linux_state_t *nvl;
+    const NvU8 *uuid;
+
+    if ((nv == NULL) || NV_IS_CTL_DEVICE(nv))
+        return -ENODEV;
+
+    nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+    if ((nvl == NULL) || !dev_is_pci(nvl->dev) ||
+        (nv->pci_info.domain > 0xffffU))
+        return -EOPNOTSUPP;
+
+    uuid = nv_get_cached_uuid(nv);
+    if (uuid == NULL)
+        return -ENODEV;
+
+    static_assert(GPU_UUID_LEN == GPU_SECURITY_UUID_SIZE);
+
+    memset(identity, 0, sizeof(*identity));
+    memcpy(identity->uuid, uuid, sizeof(identity->uuid));
+    identity->pci_domain = (u16)nv->pci_info.domain;
+    identity->pci_bus = nv->pci_info.bus;
+    identity->pci_slot = nv->pci_info.slot;
+    identity->pci_function = PCI_FUNC(nvl->pci_dev->devfn);
+
+    return 0;
+}
+#endif
+
+NV_STATUS NV_API_CALL nv_scone_gpu_authorize(
+    nv_state_t *nv,
+    NvU32 operation
+)
+{
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    struct gpu_security_identity identity;
+
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_DISCOVER ==
+                  (NvU32)GPU_SECURITY_OPERATION_DISCOVER);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_COMPUTE ==
+                  (NvU32)GPU_SECURITY_OPERATION_COMPUTE);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_MEMORY ==
+                  (NvU32)GPU_SECURITY_OPERATION_MEMORY);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_CONTROL ==
+                  (NvU32)GPU_SECURITY_OPERATION_CONTROL);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_RESET ==
+                  (NvU32)GPU_SECURITY_OPERATION_RESET);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_DEBUG ==
+                  (NvU32)GPU_SECURITY_OPERATION_DEBUG);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_PEER ==
+                  (NvU32)GPU_SECURITY_OPERATION_PEER);
+
+    if (nv_scone_gpu_identity(nv, &identity) != 0)
+        return NV_ERR_INVALID_DEVICE;
+
+    if (security_gpu_device_use(&identity, operation) != 0)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+#else
+    (void)nv;
+    (void)operation;
+#endif
+
+    return NV_OK;
+}
+
+NvBool NV_API_CALL nv_scone_gpu_exclusive_enabled(void)
+{
+    return IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU) ?
+        NV_TRUE : NV_FALSE;
+}
+
+int nv_scone_gpu_register_device(nv_linux_state_t *nvl)
+{
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    struct gpu_security_identity identity;
+    int ret;
+
+    if (nvl == NULL)
+        return -EINVAL;
+
+    ret = nv_scone_gpu_identity(NV_STATE_PTR(nvl), &identity);
+    if (ret != 0)
+        return ret;
+
+    ret = security_gpu_device_register(
+        MKDEV(NV_MAJOR_DEVICE_NUMBER, nvl->minor_num),
+        GPU_SECURITY_DEVICE_PHYSICAL, &identity);
+    if (ret != 0)
+        return ret;
+
+    nvl->scone_gpu_registered = NV_TRUE;
+#endif
+    return 0;
+}
+
+void nv_scone_gpu_unregister_device(nv_linux_state_t *nvl)
+{
+    if ((nvl == NULL) || !nvl->scone_gpu_registered)
+        return;
+
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(
+        MKDEV(NV_MAJOR_DEVICE_NUMBER, nvl->minor_num),
+        GPU_SECURITY_DEVICE_PHYSICAL);
+#endif
+    nvl->scone_gpu_registered = NV_FALSE;
+}
+
 /*
  * Search the global list of nv devices for the one with the given UUID. Devices
  * with missing UUID information are ignored. If found, nvl is returned with
@@ -1217,6 +1360,43 @@ nv_linux_state_t *find_uuid(const NvU8 *uuid)
 out:
     UNLOCK_NV_LINUX_DEVICES();
     return nvl;
+}
+
+NV_STATUS NV_API_CALL nv_scone_gpu_authorize_uuid(
+    const NvU8 *uuid,
+    NvU32 operation
+)
+{
+    nv_linux_state_t *nvl;
+    NV_STATUS status;
+
+    if (uuid == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    /* find_uuid() returns with ldata_lock held. */
+    nvl = find_uuid(uuid);
+    if (nvl == NULL)
+        return NV_ERR_INVALID_DEVICE;
+
+    status = nv_scone_gpu_authorize(NV_STATE_PTR(nvl), operation);
+    up(&nvl->ldata_lock);
+    return status;
+}
+EXPORT_SYMBOL_GPL(nv_scone_gpu_authorize_uuid);
+
+static NV_STATUS nv_scone_gpu_authorize_id(NvU32 gpu_id, NvU32 operation)
+{
+    nv_linux_state_t *nvl;
+    NV_STATUS status;
+
+    /* find_gpu_id() returns with ldata_lock held. */
+    nvl = find_gpu_id(gpu_id);
+    if (nvl == NULL)
+        return NV_ERR_INVALID_DEVICE;
+
+    status = nv_scone_gpu_authorize(NV_STATE_PTR(nvl), operation);
+    up(&nvl->ldata_lock);
+    return status;
 }
 
 /*
@@ -2368,19 +2548,24 @@ static int nvidia_read_card_info(nv_ioctl_card_info_t *ci, size_t num_entries)
 
     LOCK_NV_LINUX_DEVICES();
 
-    if (num_entries < num_nv_devices)
-    {
-        rc = -EINVAL;
-        goto out;
-    }
-
-    for (nvl = nv_linux_devices; nvl && i < num_entries; nvl = nvl->next)
+    for (nvl = nv_linux_devices; nvl; nvl = nvl->next)
     {
         nv = NV_STATE_PTR(nvl);
 
         /* We do not include excluded GPUs in the list... */
         if ((nv->flags & NV_FLAG_EXCLUDE) != 0)
             continue;
+
+        /* A control-device discovery result is itself a physical target. */
+        if (nv_scone_gpu_authorize(nv,
+                                   NV_SCONE_GPU_OPERATION_DISCOVER) != NV_OK)
+            continue;
+
+        if (i >= num_entries)
+        {
+            rc = -EINVAL;
+            goto out;
+        }
 
         ci[i].valid              = NV_TRUE;
         ci[i].pci_info.domain    = nv->pci_info.domain;
@@ -2572,6 +2757,14 @@ nvidia_ioctl(
 
     nv = NV_STATE_PTR(nvl);
 
+    if (!NV_IS_CTL_DEVICE(nv) &&
+        (nv_scone_gpu_authorize(nv,
+                                NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK))
+    {
+        status = -EACCES;
+        goto done_early;
+    }
+
     status = nv_down_read_interruptible(&nv_system_pm_lock);
     if (status < 0)
     {
@@ -2636,6 +2829,18 @@ nvidia_ioctl(
             {
                 status = -EINVAL;
                 goto done;
+            }
+
+            for (i = 0; i < num_arg_gpus; i++)
+            {
+                if ((((NvU32 *)arg_copy)[i] != 0) &&
+                    (nv_scone_gpu_authorize_id(
+                        ((NvU32 *)arg_copy)[i],
+                        NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK))
+                {
+                    status = -EACCES;
+                    goto done;
+                }
             }
 
             /* atomically check and alloc attached_gpus */
@@ -2705,6 +2910,12 @@ nvidia_ioctl(
             nv_ioctl_sys_params_t *api = arg_copy;
 
             NV_CTL_DEVICE_ONLY(nv);
+
+            if (nv_scone_gpu_exclusive_enabled())
+            {
+                status = -EOPNOTSUPP;
+                goto done;
+            }
 
             if (arg_size != sizeof(nv_ioctl_sys_params_t))
             {

@@ -69,6 +69,7 @@
 #include "nvdump.h"
 #include "gpu/gsp/kernel_gsp.h"
 #include "power/gpu_boost_mgr.h"
+#include "nv-scone.h"
 
 #define CONFIG_2X_BUFF_SIZE_MIN                                             (2)
 
@@ -98,6 +99,78 @@
 #define NVPCF0100_CTRL_CONTROLLER_FILTER_TYPE_MOVING_MAX                     (1)
 
 ct_assert(NV_GPU_UUID_LEN == VM_UUID_SIZE);
+
+static NvBool cliresSconeIsUserCall(void)
+{
+    CALL_CONTEXT *pCallContext = resservGetTlsCallContext();
+
+    return (pCallContext != NULL) &&
+           (pCallContext->secInfo.paramLocation == PARAM_LOCATION_USER);
+}
+
+static NV_STATUS cliresSconeRejectGlobalUserCall(void)
+{
+    if (cliresSconeIsUserCall() && nv_scone_gpu_exclusive_enabled())
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+    return NV_OK;
+}
+
+static NV_STATUS cliresSconeAuthorizeGpu(OBJGPU *pGpu, NvU32 operation)
+{
+    if (!cliresSconeIsUserCall())
+        return NV_OK;
+    if (pGpu == NULL)
+        return NV_ERR_INVALID_DEVICE;
+
+    return nv_scone_gpu_authorize(pGpu->pOsGpuInfo, operation);
+}
+
+static NV_STATUS cliresSconeAuthorizeGpuId(NvU32 gpuId, NvU32 operation)
+{
+    return cliresSconeAuthorizeGpu(gpumgrGetGpuFromId(gpuId), operation);
+}
+
+static NV_STATUS cliresSconeAuthorizeGpuIds(
+    const NvU32 *gpuIds,
+    NvU32 count,
+    NvU32 operation
+)
+{
+    NvU32 index;
+
+    for (index = 0; index < count; index++)
+    {
+        NV_STATUS status = cliresSconeAuthorizeGpuId(gpuIds[index],
+                                                     operation);
+
+        if (status != NV_OK)
+            return status;
+    }
+    return NV_OK;
+}
+
+static void cliresSconeFilterGpuIds(NvU32 *gpuIds, NvU32 capacity)
+{
+    NvU32 readIndex;
+    NvU32 writeIndex = 0;
+
+    if (!cliresSconeIsUserCall())
+        return;
+
+    for (readIndex = 0; readIndex < capacity; readIndex++)
+    {
+        NvU32 gpuId = gpuIds[readIndex];
+
+        if (gpuId == NV0000_CTRL_GPU_INVALID_ID)
+            break;
+        if (cliresSconeAuthorizeGpuId(
+                gpuId, NV_SCONE_GPU_OPERATION_DISCOVER) == NV_OK)
+            gpuIds[writeIndex++] = gpuId;
+    }
+
+    while (writeIndex < capacity)
+        gpuIds[writeIndex++] = NV0000_CTRL_GPU_INVALID_ID;
+}
 
 static NV_STATUS
 CliGetSystemP2pCaps_GSPCLIENT
@@ -360,6 +433,11 @@ CliGetSystemP2pCaps
         NV_PRINTF(LEVEL_WARNING, "Invalid GPU count\n");
         return NV_ERR_INVALID_ARGUMENT;
     }
+
+    rmStatus = cliresSconeAuthorizeGpuIds(
+        gpuIds, gpuCount, NV_SCONE_GPU_OPERATION_PEER);
+    if (rmStatus != NV_OK)
+        return rmStatus;
 
     // Assume no peer to peer capabilities.
     *p2pOptimalReadCEs = 0;
@@ -873,6 +951,9 @@ cliresCtrlCmdSystemExecuteAcpiMethod_IMPL
     NV0000_CTRL_SYSTEM_EXECUTE_ACPI_METHOD_PARAMS *pAcpiMethodParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJGPU     *pGpu            = NULL;
     NvU32       method          = (NvU32) pAcpiMethodParams->method;
     NvU32       outStatus       = 0;
@@ -1261,6 +1342,9 @@ cliresCtrlCmdSystemNotifyEvent_IMPL
     NV0000_CTRL_SYSTEM_NOTIFY_EVENT_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS   status    = NV_OK;
 
     switch(pParams->eventType)
@@ -1382,6 +1466,9 @@ cliresCtrlCmdSystemDebugCtrlRmMsg_IMPL
     NV0000_CTRL_SYSTEM_DEBUG_RMMSG_CTRL_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
 // NOTE: RmMsg is only available when NV_PRINTF_STRINGS_ALLOWED is true.
 #if NV_PRINTF_STRINGS_ALLOWED
     NvU32 len = 0;
@@ -1453,9 +1540,15 @@ cliresCtrlCmdGpuGetAttachedIds_IMPL
     NV0000_CTRL_GPU_GET_ATTACHED_IDS_PARAMS *pGpuAttachedIds
 )
 {
+    NV_STATUS status;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
-    return gpumgrGetAttachedGpuIds(pGpuAttachedIds);
+    status = gpumgrGetAttachedGpuIds(pGpuAttachedIds);
+    if (status == NV_OK)
+        cliresSconeFilterGpuIds(pGpuAttachedIds->gpuIds,
+                                NV0000_CTRL_GPU_MAX_ATTACHED_GPUS);
+    return status;
 }
 
 //
@@ -1471,7 +1564,14 @@ cliresCtrlCmdGpuGetIdInfo_IMPL
     NV0000_CTRL_GPU_GET_ID_INFO_PARAMS *pGpuIdInfoParams
 )
 {
+    NV_STATUS status;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
+
+    status = cliresSconeAuthorizeGpuId(
+        pGpuIdInfoParams->gpuId, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     return gpumgrGetGpuIdInfo(pGpuIdInfoParams);
 }
@@ -1483,7 +1583,14 @@ cliresCtrlCmdGpuGetIdInfoV2_IMPL
     NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS *pGpuIdInfoParams
 )
 {
+    NV_STATUS status;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
+
+    status = cliresSconeAuthorizeGpuId(
+        pGpuIdInfoParams->gpuId, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     return gpumgrGetGpuIdInfoV2(pGpuIdInfoParams);
 }
@@ -1502,7 +1609,14 @@ cliresCtrlCmdGpuGetInitStatus_IMPL
     NV0000_CTRL_GPU_GET_INIT_STATUS_PARAMS *pGpuInitStatusParams
 )
 {
+    NV_STATUS status;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
+
+    status = cliresSconeAuthorizeGpuId(
+        pGpuInitStatusParams->gpuId, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     return gpumgrGetGpuInitStatus(pGpuInitStatusParams);
 }
@@ -1521,9 +1635,26 @@ cliresCtrlCmdGpuGetDeviceIds_IMPL
     NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS *pDeviceIdsParams
 )
 {
+    NvU32 deviceInstance;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
     pDeviceIdsParams->deviceIds = gpumgrGetDeviceInstanceMask();
+    if (cliresSconeIsUserCall())
+    {
+        for (deviceInstance = 0; deviceInstance < NV_MAX_DEVICES;
+             deviceInstance++)
+        {
+            OBJGPU *pGpu;
+
+            if (!(pDeviceIdsParams->deviceIds & NVBIT(deviceInstance)))
+                continue;
+            pGpu = gpumgrGetGpuFromSubDeviceInst(deviceInstance, 0);
+            if (cliresSconeAuthorizeGpu(
+                    pGpu, NV_SCONE_GPU_OPERATION_DISCOVER) != NV_OK)
+                pDeviceIdsParams->deviceIds &= ~NVBIT(deviceInstance);
+        }
+    }
 
     return NV_OK;
 }
@@ -1542,9 +1673,29 @@ cliresCtrlCmdGpuGetActiveDeviceIds_IMPL
     NV0000_CTRL_GPU_GET_ACTIVE_DEVICE_IDS_PARAMS *pActiveDeviceIdsParams
 )
 {
+    NV_STATUS status;
+    NvU32 readIndex;
+    NvU32 writeIndex = 0;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
-    return gpumgrCacheGetActiveDeviceIds(pActiveDeviceIdsParams);
+    status = gpumgrCacheGetActiveDeviceIds(pActiveDeviceIdsParams);
+    if ((status != NV_OK) || !cliresSconeIsUserCall())
+        return status;
+
+    for (readIndex = 0; readIndex < pActiveDeviceIdsParams->numDevices;
+         readIndex++)
+    {
+        if (cliresSconeAuthorizeGpuId(
+                pActiveDeviceIdsParams->devices[readIndex].gpuId,
+                NV_SCONE_GPU_OPERATION_DISCOVER) == NV_OK)
+        {
+            pActiveDeviceIdsParams->devices[writeIndex++] =
+                pActiveDeviceIdsParams->devices[readIndex];
+        }
+    }
+    pActiveDeviceIdsParams->numDevices = writeIndex;
+    return NV_OK;
 }
 
 //
@@ -1565,6 +1716,11 @@ cliresCtrlCmdGpuGetPciInfo_IMPL
     NvU64 gpuDomainBusDevice;
 
     NV_ASSERT(rmapiLockIsOwner());
+
+    status = cliresSconeAuthorizeGpuId(
+        pPciInfoParams->gpuId, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     status = gpumgrGetProbedGpuDomainBusDevice(pPciInfoParams->gpuId, &gpuDomainBusDevice);
     if (status != NV_OK)
@@ -1591,9 +1747,41 @@ cliresCtrlCmdGpuGetProbedIds_IMPL
     NV0000_CTRL_GPU_GET_PROBED_IDS_PARAMS *pGpuProbedIds
 )
 {
+    NV_STATUS status;
+    NvU32 readIndex;
+    NvU32 writeIndex = 0;
+
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
-    return gpumgrGetProbedGpuIds(pGpuProbedIds);
+    status = gpumgrGetProbedGpuIds(pGpuProbedIds);
+    if ((status != NV_OK) || !cliresSconeIsUserCall())
+        return status;
+
+    for (readIndex = 0; readIndex < NV0000_CTRL_GPU_MAX_PROBED_GPUS;
+         readIndex++)
+    {
+        NvU32 gpuId = pGpuProbedIds->gpuIds[readIndex];
+
+        if (gpuId == NV0000_CTRL_GPU_INVALID_ID)
+            break;
+        if (cliresSconeAuthorizeGpuId(
+                gpuId, NV_SCONE_GPU_OPERATION_DISCOVER) != NV_OK)
+            continue;
+        pGpuProbedIds->gpuIds[writeIndex] = gpuId;
+        pGpuProbedIds->gpuFlags[writeIndex++] =
+            pGpuProbedIds->gpuFlags[readIndex];
+    }
+    while (writeIndex < NV0000_CTRL_GPU_MAX_PROBED_GPUS)
+    {
+        pGpuProbedIds->gpuIds[writeIndex] = NV0000_CTRL_GPU_INVALID_ID;
+        pGpuProbedIds->gpuFlags[writeIndex++] = 0;
+    }
+    for (writeIndex = 0; writeIndex < NV0000_CTRL_GPU_MAX_PROBED_GPUS;
+         writeIndex++)
+        pGpuProbedIds->excludedGpuIds[writeIndex] =
+            NV0000_CTRL_GPU_INVALID_ID;
+
+    return NV_OK;
 }
 
 //
@@ -1642,13 +1830,6 @@ cliresCtrlCmdGpuAttachIds_IMPL
 
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
-    if (pGpuAttachIds->gpuIds[0] == NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS)
-    {
-        // XXX add callback to attach logic on Windows
-        status = NV_OK;
-        goto done;
-    }
-
     pGpuProbedIds = portMemAllocNonPaged(sizeof(*pGpuProbedIds));
     if (pGpuProbedIds == NULL)
     {
@@ -1662,13 +1843,33 @@ cliresCtrlCmdGpuAttachIds_IMPL
         goto done;
     }
 
-    for (i = 0; (i < NV0000_CTRL_GPU_MAX_PROBED_GPUS) &&
-                (pGpuAttachIds->gpuIds[i] != NV0000_CTRL_GPU_INVALID_ID); i++)
+    if (pGpuAttachIds->gpuIds[0] == NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS)
     {
-        status = _cliresValidateGpuIdAgainstProbed(pGpuAttachIds->gpuIds[i],
-                                                   pGpuProbedIds);
-        if (status != NV_OK)
-            break;
+        for (i = 0; (i < NV0000_CTRL_GPU_MAX_PROBED_GPUS) &&
+                    (pGpuProbedIds->gpuIds[i] !=
+                     NV0000_CTRL_GPU_INVALID_ID); i++)
+        {
+            status = cliresSconeAuthorizeGpuId(
+                pGpuProbedIds->gpuIds[i], NV_SCONE_GPU_OPERATION_CONTROL);
+            if (status != NV_OK)
+                break;
+        }
+    }
+    else
+    {
+        for (i = 0; (i < NV0000_CTRL_GPU_MAX_PROBED_GPUS) &&
+                    (pGpuAttachIds->gpuIds[i] !=
+                     NV0000_CTRL_GPU_INVALID_ID); i++)
+        {
+            status = _cliresValidateGpuIdAgainstProbed(
+                pGpuAttachIds->gpuIds[i], pGpuProbedIds);
+            if (status != NV_OK)
+                break;
+            status = cliresSconeAuthorizeGpuId(
+                pGpuAttachIds->gpuIds[i], NV_SCONE_GPU_OPERATION_CONTROL);
+            if (status != NV_OK)
+                break;
+        }
     }
 
     // XXX add callback to attach logic on Windows
@@ -1720,6 +1921,9 @@ cliresCtrlCmdGpuAsyncAttachId_IMPL
     {
         goto done;
     }
+
+    status = cliresSconeAuthorizeGpuId(
+        pAsyncAttachIdParams->gpuId, NV_SCONE_GPU_OPERATION_CONTROL);
 
 done:
     portMemFree(pGpuProbedIds);
@@ -1774,27 +1978,31 @@ cliresCtrlCmdGpuDetachIds_IMPL
 
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
+    pGpuAttachedIds = portMemAllocNonPaged(sizeof(*pGpuAttachedIds));
+    if (pGpuAttachedIds == NULL)
+    {
+        status = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+
+    status = gpumgrGetAttachedGpuIds(pGpuAttachedIds);
+    if (status != NV_OK)
+        goto done;
+
     if (pGpuDetachIds->gpuIds[0] == NV0000_CTRL_GPU_DETACH_ALL_ATTACHED_IDS)
     {
-        // XXX add callback to detach logic on Windows
-        status = NV_OK;
-        goto done;
+        for (i = 0; (i < NV0000_CTRL_GPU_MAX_ATTACHED_GPUS) &&
+                    (pGpuAttachedIds->gpuIds[i] !=
+                     NV0000_CTRL_GPU_INVALID_ID); i++)
+        {
+            status = cliresSconeAuthorizeGpuId(
+                pGpuAttachedIds->gpuIds[i], NV_SCONE_GPU_OPERATION_CONTROL);
+            if (status != NV_OK)
+                break;
+        }
     }
     else
     {
-        pGpuAttachedIds = portMemAllocNonPaged(sizeof(*pGpuAttachedIds));
-        if (pGpuAttachedIds == NULL)
-        {
-            status = NV_ERR_NO_MEMORY;
-            goto done;
-        }
-
-        status = gpumgrGetAttachedGpuIds(pGpuAttachedIds);
-        if (status != NV_OK)
-        {
-            goto done;
-        }
-
         for (i = 0; (i < NV0000_CTRL_GPU_MAX_ATTACHED_GPUS) &&
                     (pGpuDetachIds->gpuIds[i] != NV0000_CTRL_GPU_INVALID_ID); i++)
         {
@@ -1813,8 +2021,11 @@ cliresCtrlCmdGpuDetachIds_IMPL
             }
             else
             {
-                // XXX add callback to detach logic on Windows
-                break;
+                status = cliresSconeAuthorizeGpuId(
+                    pGpuDetachIds->gpuIds[i],
+                    NV_SCONE_GPU_OPERATION_CONTROL);
+                if (status != NV_OK)
+                    break;
             }
         }
     }
@@ -1919,6 +2130,9 @@ cliresCtrlCmdGpuAcctGetProcAccountingInfo_IMPL
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     // Only lookup pid for baremetal case
     if (pAcctInfoParams->subPid == 0)
@@ -1976,6 +2190,9 @@ cliresCtrlCmdGpuAcctSetAccountingState_IMPL
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     OBJSYS     *pSys = SYS_GET_INSTANCE();
     GpuAccounting *pGpuAcct = SYS_GET_GPUACCT(pSys);
@@ -2051,6 +2268,9 @@ cliresCtrlCmdGpuAcctClearAccountingData_IMPL
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     if (IS_VIRTUAL(pGpu))
     {
@@ -2105,6 +2325,9 @@ cliresCtrlCmdGpuAcctGetAccountingState_IMPL
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     if (IS_VIRTUAL(pGpu))
     {
@@ -2159,6 +2382,9 @@ cliresCtrlCmdGpuAcctGetAccountingPids_IMPL
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     if (IS_VIRTUAL(pGpu))
     {
@@ -2199,6 +2425,9 @@ cliresCtrlCmdSystemPfmreqhndlrControl_IMPL
     NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_CONTROL_PARAMS *controlParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS                  *pSys                    = NULL;
     PlatformRequestHandler  *pPlatformRequestHandler = NULL;
     NV_STATUS  ret   = NV_OK;
@@ -2239,6 +2468,9 @@ cliresCtrlCmdSystemPfmreqhndlrBatchControl_IMPL
     NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_BATCH_CONTROL_PARAMS *controlParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS    *pSys  = NULL;
     PlatformRequestHandler       *pPlatformRequestHandler  = NULL;
     NvU32      data  = 0;
@@ -2911,6 +3143,9 @@ cliresCtrlCmdSystemNVPCFGetPowerModeInfo_IMPL
         NV_ASSERT(pGpu);
         return NV_ERR_INVALID_REQUEST;
     }
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     switch (pParams->subFunc)
     {
@@ -3478,6 +3713,9 @@ cliresCtrlCmdNvdGetDumpSize_IMPL
     NV0000_CTRL_NVD_GET_DUMP_SIZE_PARAMS *pDumpSizeParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS       *pSys  = SYS_GET_INSTANCE();
     Journal      *pRcDB = SYS_GET_RCDB(pSys);
     NVDUMP_BUFFER nvDumpBuffer = {0};
@@ -3508,6 +3746,9 @@ cliresCtrlCmdNvdGetDump_IMPL
     NV0000_CTRL_NVD_GET_DUMP_PARAMS *pDumpParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS       *pSys          = SYS_GET_INSTANCE();
     Journal      *pRcDB         = SYS_GET_RCDB(pSys);
     NVDUMP_BUFFER nvDumpBuffer  = {0};
@@ -3599,6 +3840,9 @@ cliresCtrlCmdNvdGetNvlogInfo_IMPL
     NV0000_CTRL_NVD_GET_NVLOG_INFO_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_ERR_NOT_SUPPORTED;
     NvU32 i;
 
@@ -3675,6 +3919,9 @@ cliresCtrlCmdNvdGetNvlogBufferInfo_IMPL
     NV0000_CTRL_NVD_GET_NVLOG_BUFFER_INFO_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_ERR_NOT_SUPPORTED;
 
     NV_ASSERT_OR_RETURN(pParams->component >= NV0000_CTRL_NVD_DUMP_COMPONENT_NVLOG,   NV_ERR_INVALID_ARGUMENT);
@@ -3737,6 +3984,9 @@ cliresCtrlCmdNvdGetNvlog_IMPL
     NV0000_CTRL_NVD_GET_NVLOG_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_ERR_NOT_SUPPORTED;
 
     NV_ASSERT_OR_RETURN(pParams->component >= NV0000_CTRL_NVD_DUMP_COMPONENT_NVLOG,    NV_ERR_INVALID_ARGUMENT);
@@ -3792,6 +4042,11 @@ CliGetSystemP2pCaps_GSPCLIENT
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+
+    status = cliresSconeAuthorizeGpuIds(
+        gpuIds, gpuCount, NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
 
     pGetParams = portMemAllocNonPaged(sizeof *pGetParams);
     NV_CHECK_OR_RETURN(LEVEL_INFO, pGetParams != NULL, NV_ERR_NO_MEMORY);
@@ -4335,6 +4590,17 @@ cliresCtrlCmdSystemGetP2pCapsMatrix_IMPL
         return NV_ERR_INVALID_ARGUMENT;
     }
 
+    status = cliresSconeAuthorizeGpuIds(
+        pP2PParams->gpuIdGrpA, pP2PParams->grpACount,
+        NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
+    status = cliresSconeAuthorizeGpuIds(
+        pP2PParams->gpuIdGrpB, pP2PParams->grpBCount,
+        NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
+
     pGpu = gpumgrGetGpuFromId(pP2PParams->gpuIdGrpA[0]);
     if (pGpu == NULL)
     {
@@ -4450,6 +4716,9 @@ cliresCtrlCmdSystemGetVgxSystemInfo_IMPL
     NV0000_CTRL_SYSTEM_GET_VGX_SYSTEM_INFO_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS         status = NV_OK;
     OBJGPU           *pGpu   = NULL;
     VGPU_STATIC_INFO *pVSI;
@@ -4487,6 +4756,9 @@ cliresCtrlCmdSystemGetGpusPowerStatus_IMPL
     NV0000_CTRL_SYSTEM_GET_GPUS_POWER_STATUS_PARAMS *pGpusPowerStatus
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_OK;
     OBJSYS    *pSys = SYS_GET_INSTANCE();
     OBJGPUMGR *pGpuMgr = SYS_GET_GPUMGR(pSys);
@@ -4570,6 +4842,9 @@ cliresCtrlCmdSystemGetFabricStatus_IMPL
     NV0000_CTRL_SYSTEM_GET_FABRIC_STATUS_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS *pSys = SYS_GET_INSTANCE();
     NvU32 fabricStatus = NV0000_CTRL_GET_SYSTEM_FABRIC_STATUS_SKIP;
 
@@ -4601,11 +4876,15 @@ cliresCtrlCmdGpuGetUuidInfo_IMPL
 )
 {
     OBJGPU *pGpu = NULL;
+    NV_STATUS status;
 
     pGpu = gpumgrGetGpuFromUuid(pParams->gpuUuid, pParams->flags);
 
     if (NULL == pGpu)
         return NV_ERR_OBJECT_NOT_FOUND;
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     pParams->gpuId = pGpu->gpuId;
     pParams->deviceInstance = gpuGetDeviceInstance(pGpu);
@@ -4646,6 +4925,23 @@ cliresCtrlCmdGpuGetUuidFromGpuId_IMPL
             return rmStatus;
         }
     }
+    else
+    {
+        pGpu = gpumgrGetGpuFromId(pParams->gpuId);
+        if (pGpu == NULL)
+        {
+            portMemFree(pGidString);
+            return NV_ERR_OBJECT_NOT_FOUND;
+        }
+    }
+
+    rmStatus = cliresSconeAuthorizeGpu(pGpu,
+                                       NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (rmStatus != NV_OK)
+    {
+        portMemFree(pGidString);
+        return rmStatus;
+    }
 
     if (gidStrLen <= NV0000_GPU_MAX_GID_LENGTH)
     {
@@ -4671,6 +4967,10 @@ cliresCtrlCmdGpuModifyGpuDrainState_IMPL
     NvBool    bRemove = NV_FALSE;
     NvBool    bLinkDisable = NV_FALSE;
     OBJGPU   *pGpu = gpumgrGetGpuFromId(pParams->gpuId);
+
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_CONTROL);
+    if (status != NV_OK)
+        return status;
 
     if (NV0000_CTRL_GPU_DRAIN_STATE_ENABLED == pParams->newState)
     {
@@ -4740,6 +5040,11 @@ cliresCtrlCmdGpuQueryGpuDrainState_IMPL
     NvBool    bDrainState;
     NvBool    bRemove;
     NV_STATUS status;
+
+    status = cliresSconeAuthorizeGpuId(
+        pParams->gpuId, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     status = gpumgrQueryGpuDrainState(pParams->gpuId, &bDrainState, &bRemove);
 
@@ -4843,6 +5148,9 @@ cliresCtrlCmdSyncGpuBoostGroupCreate_IMPL
     NV0000_SYNC_GPU_BOOST_GROUP_CREATE_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS       status    = NV_OK;
     OBJSYS         *pSys      = SYS_GET_INSTANCE();
     OBJGPUBOOSTMGR *pBoostMgr = SYS_GET_GPUBOOSTMGR(pSys);
@@ -4871,6 +5179,9 @@ cliresCtrlCmdSyncGpuBoostGroupDestroy_IMPL
     NV0000_SYNC_GPU_BOOST_GROUP_DESTROY_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS       status    = NV_OK;
     OBJSYS         *pSys      = SYS_GET_INSTANCE();
     OBJGPUBOOSTMGR *pBoostMgr = SYS_GET_GPUBOOSTMGR(pSys);
@@ -4895,6 +5206,9 @@ cliresCtrlCmdSyncGpuBoostGroupInfo_IMPL
 )
 {
 
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS       status    = NV_OK;
     OBJSYS         *pSys      = SYS_GET_INSTANCE();
     OBJGPUBOOSTMGR *pBoostMgr = SYS_GET_GPUBOOSTMGR(pSys);
@@ -4914,6 +5228,8 @@ cliresCtrlCmdVgpuVfioNotifyRMStatus_IMPL
     NV0000_CTRL_VGPU_VFIO_NOTIFY_RM_STATUS_PARAMS *pVgpuStatusParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
 
     if (osIsVgpuVfioPresent() != NV_OK)
         return NV_ERR_NOT_SUPPORTED;
@@ -4953,6 +5269,9 @@ cliresCtrlCmdVgpuSetVgpuVersion_IMPL
     NV0000_CTRL_VGPU_SET_VGPU_VERSION_PARAMS *vgpuVersionInfo
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     return (kvgpumgrSetHostVgpuVersion(vgpuVersionInfo->min_version,
                                        vgpuVersionInfo->max_version));
 }
@@ -5117,6 +5436,9 @@ cliresCtrlCmdClientShareObject_IMPL
     NV0000_CTRL_CLIENT_SHARE_OBJECT_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     RS_SHARE_POLICY *pSharePolicy = &pParams->sharePolicy;
     RsClient        *pClient = RES_GET_CLIENT(pRmCliRes);
     RsResourceRef   *pObjectRef;
@@ -5227,6 +5549,9 @@ cliresCtrlCmdClientSubscribeToImexChannel_IMPL
     NV0000_CTRL_CLIENT_SUBSCRIBE_TO_IMEX_CHANNEL_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     RsClient *pClient = RES_GET_CLIENT(pRmCliRes);
     RmClient *pRmClient = dynamicCast(pClient, RmClient);
     NvS32 channel;
@@ -5303,6 +5628,10 @@ cliresCtrlCmdGpuDisableNvlinkInit_IMPL
         return NV_ERR_INVALID_ARGUMENT;
     }
 
+    if (cliresSconeAuthorizeGpuId(
+            pParams->gpuId, NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     return gpumgrSetGpuInitDisabledNvlinks(pParams->gpuId, pParams->mask,
                                            &pParams->links, pParams->bSkipHwNvlinkDisable);
 }
@@ -5314,6 +5643,9 @@ cliresCtrlCmdGpuSetNvlinkBwMode_IMPL
     NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     return gpumgrSetGpuNvlinkBwMode(pParams->mode);
 }
 
@@ -5341,6 +5673,9 @@ cliresCtrlCmdNvdGetRcerrRpt_IMPL
     NV0000_CTRL_CMD_NVD_GET_RCERR_RPT_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status         = NV_OK;
     NvU32     gpuMask        = 0;
     NvU32     gpuAttachCount = 0;
@@ -5459,6 +5794,9 @@ cliresCtrlCmdSystemSyncExternalFabricMgmt_IMPL
     NV0000_CTRL_CMD_SYSTEM_SYNC_EXTERNAL_FABRIC_MGMT_PARAMS *pExtFabricMgmtParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     OBJSYS *pSys = SYS_GET_INSTANCE();
 
     pSys->setProperty(pSys, PDB_PROP_SYS_FABRIC_IS_EXTERNALLY_MANAGED,
@@ -5507,6 +5845,10 @@ NV_STATUS cliresCtrlCmdSystemRmctrlCacheModeCtrl_IMPL
     NV0000_CTRL_SYSTEM_RMCTRL_CACHE_MODE_CTRL_PARAMS *pParams
 )
 {
+    if ((pParams->cmd == NV0000_CTRL_SYSTEM_RMCTRL_CACHE_MODE_CTRL_CMD_SET) &&
+        (cliresSconeRejectGlobalUserCall() != NV_OK))
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     switch (pParams->cmd)
     {
         case NV0000_CTRL_SYSTEM_RMCTRL_CACHE_MODE_CTRL_CMD_SET:
@@ -5528,6 +5870,9 @@ cliresCtrlCmdSystemPfmreqhndlrGetPerfSensorCounters_IMPL
     NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_GET_PERF_SENSOR_COUNTERS_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_OK;
     status = pfmreqhndlrGetPerfSensorCounters(pParams, PFM_REQ_HNDLR_PSR_PUB_TAG);
     return status;
@@ -5540,6 +5885,9 @@ cliresCtrlCmdSystemPfmreqhndlrGetExtendedPerfSensorCounters_IMPL
     NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_GET_PERF_SENSOR_COUNTERS_PARAMS *pParams
 )
 {
+    if (cliresSconeRejectGlobalUserCall() != NV_OK)
+        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+
     NV_STATUS status = NV_OK;
     status = pfmreqhndlrGetPerfSensorCounters(pParams, 0);
     return status;
@@ -5609,6 +5957,10 @@ cliresCtrlCmdSystemGetVrrCookiePresent_IMPL
     {
         return NV_ERR_INVALID_REQUEST;
     }
+
+    status = cliresSconeAuthorizeGpu(pGpu, NV_SCONE_GPU_OPERATION_DISCOVER);
+    if (status != NV_OK)
+        return status;
 
     status = getAcpiDsmObjectData(pGpu, &pObjData, &objSize,
                                   ACPI_DSM_FUNCTION_CURRENT, NBSI_VALKEY, NBSI_VALIDATE_ALL);

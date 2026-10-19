@@ -23,6 +23,7 @@
 
 #include "uvm_api.h"
 #include "uvm_va_space.h"
+#include "nv-scone.h"
 #include "uvm_va_range.h"
 #include "uvm_lock.h"
 #include "uvm_global.h"
@@ -742,6 +743,11 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
     bool gpu_can_access_sysmem = true;
     uvm_processor_mask_t *peers_to_release = NULL;
     bool enable_hmm = !(va_space->initialization_flags & UVM_INIT_FLAGS_DISABLE_HMM);
+
+    status = nv_scone_gpu_authorize_uuid(
+        gpu_uuid->uuid, NV_SCONE_GPU_OPERATION_MEMORY);
+    if (status != NV_OK)
+        return status;
 
     status = uvm_gpu_retain_by_uuid(gpu_uuid, user_rm_device, &va_space->test.parent_gpu_error, enable_hmm, &gpu);
     if (status != NV_OK)
@@ -1999,6 +2005,15 @@ NV_STATUS uvm_api_enable_peer_access(UVM_ENABLE_PEER_ACCESS_PARAMS *params, stru
     uvm_gpu_t *gpu1 = NULL;
     NvU32 pair_index;
 
+    status = nv_scone_gpu_authorize_uuid(
+        params->gpuUuidA.uuid, NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
+    status = nv_scone_gpu_authorize_uuid(
+        params->gpuUuidB.uuid, NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
+
     uvm_mutex_lock(&g_uvm_global.global_lock);
     status = retain_pcie_peers_from_uuids(va_space, &params->gpuUuidA, &params->gpuUuidB, &gpu0, &gpu1);
 
@@ -2031,6 +2046,15 @@ NV_STATUS uvm_api_disable_peer_access(UVM_DISABLE_PEER_ACCESS_PARAMS *params, st
     NV_STATUS status = NV_OK;
     uvm_gpu_t *gpu0, *gpu1;
     LIST_HEAD(deferred_free_list);
+
+    status = nv_scone_gpu_authorize_uuid(
+        params->gpuUuidA.uuid, NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
+    status = nv_scone_gpu_authorize_uuid(
+        params->gpuUuidB.uuid, NV_SCONE_GPU_OPERATION_PEER);
+    if (status != NV_OK)
+        return status;
 
     uvm_va_space_down_write(va_space);
 

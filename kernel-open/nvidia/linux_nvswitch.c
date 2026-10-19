@@ -1716,6 +1716,12 @@ nvswitch_init
 {
     int rc;
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    printk(KERN_ERR
+           "nvidia-nvswitch: disabled by SCONE exclusive whole-GPU admission\n");
+    return -EOPNOTSUPP;
+#endif
+
     if (nvswitch.initialized)
     {
         printk(KERN_ERR "nvidia-nvswitch: Interface already initialized\n");

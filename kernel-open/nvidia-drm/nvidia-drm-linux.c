@@ -49,6 +49,10 @@ module_param_named(fbdev, nv_drm_fbdev_module_param, bool, 0400);
 
 static int __init nv_linux_drm_init(void)
 {
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    pr_err("nvidia-drm: disabled by SCONE exclusive whole-GPU admission\n");
+    return -EOPNOTSUPP;
+#endif
     return nv_drm_init();
 }
 

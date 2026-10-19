@@ -38,6 +38,11 @@
 #include "uvm_mem.h"
 #include "nv_speculation_barrier.h"
 
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+#include <linux/scone_domain_gpu.h>
+#include <linux/security.h>
+#endif
+
 // We limit the number of times a page can be retained by the kernel
 // to prevent the user from maliciously passing UVM tools the same page
 // over and over again in an attempt to overflow the refcount.
@@ -178,6 +183,7 @@ typedef struct
 
 
 static struct cdev g_uvm_tools_cdev;
+static dev_t g_uvm_tools_dev;
 static LIST_HEAD(g_tools_va_space_list);
 static NvU32 g_tools_enabled_event_count[UvmEventNumTypesAll];
 static uvm_rw_semaphore_t g_tools_va_space_list_lock;
@@ -643,6 +649,10 @@ static bool tools_is_migration_callback_needed(uvm_va_space_t *va_space)
 
 static int uvm_tools_open(struct inode *inode, struct file *filp)
 {
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    /* Cross-process observation is outside whole-GPU cGPU admission. */
+    return -EACCES;
+#endif
     filp->private_data = NULL;
     return -nv_status_to_errno(uvm_global_get_status());
 }
@@ -2788,8 +2798,9 @@ static void _uvm_tools_destroy_cache_all(void)
 
 int uvm_tools_init(dev_t uvm_base_dev)
 {
-    dev_t uvm_tools_dev = MKDEV(MAJOR(uvm_base_dev), NVIDIA_UVM_TOOLS_MINOR_NUMBER);
     int ret = -ENOMEM; // This will be updated later if allocations succeed
+
+    g_uvm_tools_dev = MKDEV(MAJOR(uvm_base_dev), NVIDIA_UVM_TOOLS_MINOR_NUMBER);
 
     uvm_init_rwsem(&g_tools_va_space_list_lock, UVM_LOCK_ORDER_TOOLS_VA_SPACE_LIST);
 
@@ -2830,15 +2841,28 @@ int uvm_tools_init(dev_t uvm_base_dev)
         goto err_cache_destroy;
 
     uvm_init_character_device(&g_uvm_tools_cdev, &uvm_tools_fops);
-    ret = cdev_add(&g_uvm_tools_cdev, uvm_tools_dev, 1);
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    ret = security_gpu_device_register(g_uvm_tools_dev,
+                                       GPU_SECURITY_DEVICE_UVM, NULL);
     if (ret != 0) {
-        UVM_ERR_PRINT("cdev_add (major %u, minor %u) failed: %d\n", MAJOR(uvm_tools_dev),
-                      MINOR(uvm_tools_dev), ret);
+        UVM_ERR_PRINT("SCONE registration failed for nvidia-uvm-tools: %d\n", ret);
         goto err_stop_thread;
+    }
+#endif
+    ret = cdev_add(&g_uvm_tools_cdev, g_uvm_tools_dev, 1);
+    if (ret != 0) {
+        UVM_ERR_PRINT("cdev_add (major %u, minor %u) failed: %d\n", MAJOR(g_uvm_tools_dev),
+                      MINOR(g_uvm_tools_dev), ret);
+        goto err_security_unregister;
     }
 
     return ret;
 
+err_security_unregister:
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(g_uvm_tools_dev,
+                                   GPU_SECURITY_DEVICE_UVM);
+#endif
 err_stop_thread:
     nv_kthread_q_stop(&g_tools_queue);
 
@@ -2850,6 +2874,10 @@ err_cache_destroy:
 void uvm_tools_exit(void)
 {
     unsigned i;
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(g_uvm_tools_dev,
+                                   GPU_SECURITY_DEVICE_UVM);
+#endif
     cdev_del(&g_uvm_tools_cdev);
 
     nv_kthread_q_stop(&g_tools_queue);

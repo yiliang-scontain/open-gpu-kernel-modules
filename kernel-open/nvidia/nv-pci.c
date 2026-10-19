@@ -2154,6 +2154,18 @@ nv_pci_probe
         }
     }
 
+    if (!(nv->flags & NV_FLAG_EXCLUDE))
+    {
+        int ret = nv_scone_gpu_register_device(nvl);
+
+        if (ret != 0)
+        {
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "SCONE GPU registration failed (ret=%d)", ret);
+            goto err_stop_device;
+        }
+    }
+
     /*
      * The newly created nvl object is added to the nv_linux_devices global list
      * only after all the initialization operations for that nvl object are
@@ -2212,8 +2224,10 @@ err_free_all:
     LOCK_NV_LINUX_DEVICES();
     nv_linux_remove_device_locked(nvl);
     UNLOCK_NV_LINUX_DEVICES();
+err_stop_device:
     if (nvl->init_on_probe)
         nv_stop_device(nv, sp);
+    nv_scone_gpu_unregister_device(nvl);
 err_remove_minor:
     LOCK_NV_LINUX_DEVICES();
     nv_linux_remove_minor_locked(nvl);
@@ -2398,6 +2412,7 @@ static void nv_pci_remove_helper(struct pci_dev *pci_dev, bool block_if_gpu_in_u
         nv_stop_device(nv, sp);
     }
 
+    nv_scone_gpu_unregister_device(nvl);
     nv_linux_remove_minor_locked(nvl);
     nv->removed = NV_TRUE;
 

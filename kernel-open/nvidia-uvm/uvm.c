@@ -39,6 +39,12 @@
 #include "uvm_mem.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_test_file.h"
+#include "nv-scone.h"
+
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+#include <linux/scone_domain_gpu.h>
+#include <linux/security.h>
+#endif
 
 #define NVIDIA_UVM_DEVICE_NAME          "nvidia-uvm"
 
@@ -1050,14 +1056,37 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     return uvm_test_ioctl(filp, cmd, arg);
 }
 
+static NV_STATUS uvm_scone_authorize_va_space(struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_fd_va_space(filp);
+    uvm_gpu_t *gpu;
+    NV_STATUS status = NV_OK;
+
+    if (va_space == NULL)
+        return NV_OK;
+
+    uvm_va_space_down_read(va_space);
+    for_each_va_space_gpu(gpu, va_space) {
+        status = nv_scone_gpu_authorize_uuid(
+            gpu->parent->uuid.uuid, NV_SCONE_GPU_OPERATION_MEMORY);
+        if (status != NV_OK)
+            break;
+    }
+    uvm_va_space_up_read(va_space);
+
+    return status;
+}
+
 static long uvm_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     long ret;
+    NV_STATUS status;
 
     if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
         return -EAGAIN;
 
-    ret = uvm_ioctl(filp, cmd, arg);
+    status = uvm_scone_authorize_va_space(filp);
+    ret = (status == NV_OK) ? uvm_ioctl(filp, cmd, arg) : -EACCES;
 
     uvm_up_read(&g_uvm_global.pm.lock);
 
@@ -1144,9 +1173,21 @@ static int uvm_chardev_create(void)
     uvm_dev = MKDEV(MAJOR(g_uvm_base_dev), NVIDIA_UVM_PRIMARY_MINOR_NUMBER);
 
     uvm_init_character_device(&g_uvm_cdev, &uvm_fops);
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    ret = security_gpu_device_register(uvm_dev,
+                                       GPU_SECURITY_DEVICE_UVM, NULL);
+    if (ret != 0) {
+        UVM_ERR_PRINT("SCONE registration failed for nvidia-uvm: %d\n", ret);
+        unregister_chrdev_region(g_uvm_base_dev, NVIDIA_UVM_NUM_MINOR_DEVICES);
+        return ret;
+    }
+#endif
     ret = cdev_add(&g_uvm_cdev, uvm_dev, 1);
     if (ret != 0) {
         UVM_ERR_PRINT("cdev_add (major %u, minor %u) failed: %d\n", MAJOR(uvm_dev), MINOR(uvm_dev), ret);
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+        security_gpu_device_unregister(uvm_dev, GPU_SECURITY_DEVICE_UVM);
+#endif
         unregister_chrdev_region(g_uvm_base_dev, NVIDIA_UVM_NUM_MINOR_DEVICES);
         return ret;
     }
@@ -1156,6 +1197,11 @@ static int uvm_chardev_create(void)
 
 static void uvm_chardev_exit(void)
 {
+    dev_t uvm_dev = MKDEV(MAJOR(g_uvm_base_dev), NVIDIA_UVM_PRIMARY_MINOR_NUMBER);
+
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    security_gpu_device_unregister(uvm_dev, GPU_SECURITY_DEVICE_UVM);
+#endif
     cdev_del(&g_uvm_cdev);
     unregister_chrdev_region(g_uvm_base_dev, NVIDIA_UVM_NUM_MINOR_DEVICES);
 }
