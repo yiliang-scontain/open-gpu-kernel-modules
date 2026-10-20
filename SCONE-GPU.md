@@ -21,11 +21,18 @@ The security boundary has the following driver-side patch points:
    unauthorized GPUs, and `NV_ESC_ATTACH_GPUS_TO_FD` authorizes every GPU ID
    before changing the file's attachment set.
 4. User-originated RM resource allocation and RM control requests authorize
-   the resolved physical `OBJGPU` before executing the operation.  This covers
-   the compute/control object paths after RM has resolved a target.  Root RM
-   discovery arrays are filtered, GPU-ID parameters and peer groups are
-   authorized explicitly, and targetless global mutation or diagnostic paths
-   are rejected.  Cross-client object duplication and sharing are rejected.
+   the resolved physical `OBJGPU` before executing the operation.  Allocation
+   is classified by the resource's NVOC ancestry: memory, VA-space, and
+   context-DMA resources require `MEMORY`; channels, channel groups, and
+   channel descendants require `COMPUTE`; peer resources require `PEER`;
+   debugger resources require `DEVICE_ADMIN`; and device binding plus every
+   other ordinary allocation requires `CONTROL`.  RM controls use the same
+   ancestry classification.  Privileged controls and whole-device reset or
+   debug controls require `DEVICE_ADMIN`, which the kernel rejects for a
+   `SHARE_ACROSS_TD` assignment.  Root RM discovery arrays are filtered, GPU-ID
+   parameters and peer groups are authorized explicitly, and targetless global
+   mutation or diagnostic paths are rejected.  Cross-client object duplication
+   and sharing are rejected.
 5. `nvidia-uvm.ko` registers `/dev/nvidia-uvm` and its tools minor as UVM
    gateways.  GPU registration and peer operations authorize UUID targets,
    while every subsequent VA-space ioctl reauthorizes all GPUs retained by
@@ -53,10 +60,13 @@ both core RM and UVM can defer teardown to driver kernel threads.
 
 ## Security assumptions and unsupported configurations
 
-The patch implements physical, whole-GPU ownership.  MIG, vGPU, display,
-NVSwitch, peer-memory, UVM tools, and cross-TD sharing are not supported.
-Peer authorization exists for completeness but succeeds only when both whole
-GPUs are admitted to the same current TD.
+The patch implements physical, whole-GPU ownership.  A policy may explicitly
+share the physical assignment across TDs, but every TD must use separate file
+descriptions, RM clients, channels, mappings, and UVM VA spaces; cross-TD RM or
+UVM context sharing remains unsupported.  MIG, vGPU, display, NVSwitch,
+peer-memory, and UVM tools are not supported.  Peer authorization exists for
+completeness but succeeds only when both whole GPUs are admitted to the same
+current TD.
 
 The SCONE generic device hooks bind every opened physical or gateway file to
 the TD generation and activation epoch.  Consequently, RM handles reachable

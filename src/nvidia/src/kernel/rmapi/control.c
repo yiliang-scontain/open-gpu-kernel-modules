@@ -36,6 +36,7 @@
 #include "gpu_mgr/gpu_mgr.h"
 #include "gpu/gpu.h"
 #include "rmapi/rmapi_specific.h"
+#include "resource_desc.h"
 #include "rmapi/rmapi_utils.h"
 #include "kernel/gpu/gsp/gsp_trace_rats_macro.h"
 #include "nv-scone.h"
@@ -43,6 +44,44 @@
 #include "ctrl/ctrl0000/ctrl0000gpuacct.h" // NV0000_CTRL_CMD_GPUACCT_*
 #include "ctrl/ctrl2080/ctrl2080tmr.h" // NV2080_CTRL_CMD_TIMER_SCHEDULE
 #include "ctrl/ctrl2080/ctrl2080fb.h" // NV2080_CTRL_CMD_FB_GET_MEM_ALIGNMENT
+#include "ctrl/ctrl0080/ctrl0080bif.h" // NV0080_CTRL_CMD_BIF_RESET
+#include "ctrl/ctrl2080/ctrl2080gpu.h" // NV2080_CTRL_CMD_GPU_*
+
+static NvU32
+sconeOperationForControl
+(
+    NvU32 cmd,
+    NvU32 ctrlFlags
+)
+{
+    RS_RESOURCE_DESC *pResDesc;
+    NvU32 operation;
+
+    switch (cmd)
+    {
+        case NV0080_CTRL_CMD_BIF_RESET:
+        case NV2080_CTRL_CMD_GPU_RESET_ECC_ERROR_STATUS:
+        case NV2080_CTRL_CMD_GPU_SET_GPU_DEBUG_MODE:
+        case NV2080_CTRL_CMD_GPU_GET_GPU_DEBUG_MODE:
+        case NV2080_CTRL_CMD_GPU_MARK_DEVICE_FOR_RESET:
+        case NV2080_CTRL_CMD_GPU_UNMARK_DEVICE_FOR_RESET:
+        case NV2080_CTRL_CMD_GPU_GET_RESET_STATUS:
+        case NV2080_CTRL_CMD_GPU_MARK_DEVICE_FOR_DRAIN_AND_RESET:
+        case NV2080_CTRL_CMD_GPU_UNMARK_DEVICE_FOR_DRAIN_AND_RESET:
+        case NV2080_CTRL_CMD_GPU_GET_DRAIN_AND_RESET_STATUS:
+            return NV_SCONE_GPU_OPERATION_DEVICE_ADMIN;
+        default:
+            break;
+    }
+
+    if ((ctrlFlags & RMCTRL_FLAGS_PRIVILEGED) != 0)
+        return NV_SCONE_GPU_OPERATION_DEVICE_ADMIN;
+
+    pResDesc = RsResInfoByExternalClassId(
+        DRF_VAL(XXXX, _CTRL_CMD, _CLASS, cmd));
+    operation = rmapiSconeOperationForResourceDesc(pResDesc);
+    return operation;
+}
 
 static NV_STATUS
 releaseDeferRmCtrlBuffer(RmCtrlDeferredCmd* pRmCtrlDeferredCmd)
@@ -789,7 +828,9 @@ NV_STATUS serverControl_ValidateCookie
     {
         if ((pRmCtrlParams->secInfo.paramLocation == PARAM_LOCATION_USER) &&
             (nv_scone_gpu_authorize(pRmCtrlParams->pGpu->pOsGpuInfo,
-                                    NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK))
+                                    sconeOperationForControl(
+                                        pRmCtrlParams->cmd,
+                                        pRmCtrlExecuteCookie->ctrlFlags)) != NV_OK))
         {
             return NV_ERR_INSUFFICIENT_PERMISSIONS;
         }

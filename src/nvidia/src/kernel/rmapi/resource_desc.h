@@ -59,5 +59,6 @@ NvU32 RsResInfoGetInternalClassId(const RS_RESOURCE_DESC *);
 
 /** Get the global resource info table */
 void RsResInfoGetResourceList(const RS_RESOURCE_DESC **ppResourceList, NvU32 *numResources);
+NvU32 rmapiSconeOperationForResourceDesc(const RS_RESOURCE_DESC *pResDesc);
 
 #endif // _RESOURCE_DESC_H_

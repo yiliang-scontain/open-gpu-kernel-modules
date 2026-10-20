@@ -27,12 +27,11 @@ static inline NvBool nv_scone_gpu_lease_token_valid(
 /* Keep these values synchronized with enum gpu_security_operation. */
 enum nv_scone_gpu_operation {
     NV_SCONE_GPU_OPERATION_DISCOVER = 1,
-    NV_SCONE_GPU_OPERATION_COMPUTE = 2,
+    NV_SCONE_GPU_OPERATION_CONTROL = 2,
     NV_SCONE_GPU_OPERATION_MEMORY = 3,
-    NV_SCONE_GPU_OPERATION_CONTROL = 4,
-    NV_SCONE_GPU_OPERATION_RESET = 5,
-    NV_SCONE_GPU_OPERATION_DEBUG = 6,
-    NV_SCONE_GPU_OPERATION_PEER = 7,
+    NV_SCONE_GPU_OPERATION_COMPUTE = 4,
+    NV_SCONE_GPU_OPERATION_PEER = 5,
+    NV_SCONE_GPU_OPERATION_DEVICE_ADMIN = 6,
 };
 
 NV_STATUS NV_API_CALL nv_scone_gpu_authorize(struct nv_state_t *nv,

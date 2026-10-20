@@ -40,6 +40,15 @@
 #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
 
 #include "gpu/device/device.h"
+#include "kernel/gpu/bus/p2p_api.h"
+#include "kernel/gpu/bus/third_party_p2p.h"
+#include "kernel/gpu/fifo/channel_descendant.h"
+#include "kernel/gpu/fifo/kernel_channel.h"
+#include "kernel/gpu/fifo/kernel_channel_group_api.h"
+#include "kernel/gpu/mem_mgr/context_dma.h"
+#include "kernel/gpu/mem_mgr/vaspace_api.h"
+#include "kernel/mem_mgr/mem.h"
+#include "nvoc/rtti.h"
 #include "class/cl0080.h"
 #include "class/clc372sw.h"
 #include "nv-scone.h"
@@ -59,6 +68,70 @@
 #define RM_ALLOC_STATES_INTERNAL_ALLOC          NVBIT(7)
 
 #define RM_FREE_STATES_NONE                     0
+
+static NvBool
+sconeResourceClassIsA
+(
+    const RS_RESOURCE_DESC *pResDesc,
+    NvU32                   baseClassId
+)
+{
+    const struct NVOC_CLASS_DEF *pClassDef;
+    NvU32 i;
+
+    if ((pResDesc == NULL) || (pResDesc->pClassInfo == NULL))
+        return NV_FALSE;
+
+    pClassDef = (const struct NVOC_CLASS_DEF *)(const void *)pResDesc->pClassInfo;
+    if (pClassDef->pCastInfo == NULL)
+        return NV_FALSE;
+
+    for (i = 0; i < pClassDef->pCastInfo->numRelatives; i++)
+    {
+        if (pClassDef->pCastInfo->relatives[i]->pClassDef->classInfo.classId ==
+            baseClassId)
+        {
+            return NV_TRUE;
+        }
+    }
+
+    return NV_FALSE;
+}
+
+NvU32
+rmapiSconeOperationForResourceDesc
+(
+    const RS_RESOURCE_DESC *pResDesc
+)
+{
+    if (sconeResourceClassIsA(pResDesc, classId(KernelSMDebuggerSession)))
+    {
+        return NV_SCONE_GPU_OPERATION_DEVICE_ADMIN;
+    }
+
+    if (sconeResourceClassIsA(pResDesc, classId(P2PApi)) ||
+        sconeResourceClassIsA(pResDesc, classId(ThirdPartyP2P)))
+    {
+        return NV_SCONE_GPU_OPERATION_PEER;
+    }
+
+    if (sconeResourceClassIsA(pResDesc, classId(Memory)) ||
+        sconeResourceClassIsA(pResDesc, classId(VaSpaceApi)) ||
+        sconeResourceClassIsA(pResDesc, classId(ContextDma)))
+    {
+        return NV_SCONE_GPU_OPERATION_MEMORY;
+    }
+
+    if (sconeResourceClassIsA(pResDesc, classId(KernelChannel)) ||
+        sconeResourceClassIsA(pResDesc, classId(KernelChannelGroupApi)) ||
+        sconeResourceClassIsA(pResDesc, classId(ChannelDescendant)))
+    {
+        return NV_SCONE_GPU_OPERATION_COMPUTE;
+    }
+
+    /* Device binding and all other ordinary RM allocation controls. */
+    return NV_SCONE_GPU_OPERATION_CONTROL;
+}
 
 static void
 rmapiResourceDescToLegacyFlags
@@ -1402,7 +1475,7 @@ resservResourceFactory
     if ((pGpu != NULL) &&
         (pCallContext->secInfo.paramLocation == PARAM_LOCATION_USER) &&
         (nv_scone_gpu_authorize(pGpu->pOsGpuInfo,
-                                NV_SCONE_GPU_OPERATION_COMPUTE) != NV_OK))
+                                rmapiSconeOperationForResourceDesc(pResDesc)) != NV_OK))
     {
         return NV_ERR_INSUFFICIENT_PERMISSIONS;
     }

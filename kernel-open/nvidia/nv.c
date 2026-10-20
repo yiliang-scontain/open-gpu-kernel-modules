@@ -1265,18 +1265,16 @@ NV_STATUS NV_API_CALL nv_scone_gpu_authorize(
 
     static_assert((NvU32)NV_SCONE_GPU_OPERATION_DISCOVER ==
                   (NvU32)GPU_SECURITY_OPERATION_DISCOVER);
-    static_assert((NvU32)NV_SCONE_GPU_OPERATION_COMPUTE ==
-                  (NvU32)GPU_SECURITY_OPERATION_COMPUTE);
-    static_assert((NvU32)NV_SCONE_GPU_OPERATION_MEMORY ==
-                  (NvU32)GPU_SECURITY_OPERATION_MEMORY);
     static_assert((NvU32)NV_SCONE_GPU_OPERATION_CONTROL ==
                   (NvU32)GPU_SECURITY_OPERATION_CONTROL);
-    static_assert((NvU32)NV_SCONE_GPU_OPERATION_RESET ==
-                  (NvU32)GPU_SECURITY_OPERATION_RESET);
-    static_assert((NvU32)NV_SCONE_GPU_OPERATION_DEBUG ==
-                  (NvU32)GPU_SECURITY_OPERATION_DEBUG);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_MEMORY ==
+                  (NvU32)GPU_SECURITY_OPERATION_MEMORY);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_COMPUTE ==
+                  (NvU32)GPU_SECURITY_OPERATION_COMPUTE);
     static_assert((NvU32)NV_SCONE_GPU_OPERATION_PEER ==
                   (NvU32)GPU_SECURITY_OPERATION_PEER);
+    static_assert((NvU32)NV_SCONE_GPU_OPERATION_DEVICE_ADMIN ==
+                  (NvU32)GPU_SECURITY_OPERATION_DEVICE_ADMIN);
 
     if (nv_scone_gpu_identity(nv, &identity) != 0)
         return NV_ERR_INVALID_DEVICE;
