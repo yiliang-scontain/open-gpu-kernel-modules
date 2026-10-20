@@ -1500,7 +1500,6 @@ typedef struct
     size_t num_attached_gpus;
     nv_scone_gpu_lease_token_t *scone_gpu_lease_tokens;
     nv_scone_gpu_lease_token_t scone_gpu_lease_token;
-    nv_linux_state_t *scone_gpu_lease_nvl;
     struct address_space mapping;
 
     struct rw_semaphore fileVaLock;

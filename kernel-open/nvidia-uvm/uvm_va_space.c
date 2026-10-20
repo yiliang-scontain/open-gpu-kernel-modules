@@ -617,12 +617,10 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
             }
         }
 
-        nv_scone_gpu_release_uuid(
-            gpu->uuid.uuid, &lease_tokens[uvm_id_value(gpu_id)]);
+        uvm_gpu_release_locked(gpu);
+        nv_scone_gpu_release(&lease_tokens[uvm_id_value(gpu_id)]);
         memset(&lease_tokens[uvm_id_value(gpu_id)], 0,
                sizeof(lease_tokens[uvm_id_value(gpu_id)]));
-
-        uvm_gpu_release_locked(gpu);
     }
 
     UVM_ASSERT(bitmap_empty(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS));
@@ -762,7 +760,7 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
 
     status = uvm_gpu_retain_by_uuid(gpu_uuid, user_rm_device, &va_space->test.parent_gpu_error, enable_hmm, &gpu);
     if (status != NV_OK) {
-        nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
+        nv_scone_gpu_release(&lease_token);
         return status;
     }
 
@@ -778,7 +776,7 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
         status = uvm_gpu_access_counters_enable(gpu, va_space);
         if (status != NV_OK) {
             uvm_gpu_release(gpu);
-            nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
+            nv_scone_gpu_release(&lease_token);
             return status;
         }
     }
@@ -963,7 +961,7 @@ done:
             uvm_gpu_access_counters_disable(gpu, va_space);
 
         uvm_gpu_release(gpu);
-        nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
+        nv_scone_gpu_release(&lease_token);
     }
 
     return status;
@@ -1091,9 +1089,8 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
 
     uvm_processor_mask_cache_free(peers_to_release);
 
-    nv_scone_gpu_release_uuid(gpu_uuid->uuid, &lease_token);
-
     uvm_gpu_release_locked(gpu);
+    nv_scone_gpu_release(&lease_token);
 
     uvm_mutex_unlock(&g_uvm_global.global_lock);
 

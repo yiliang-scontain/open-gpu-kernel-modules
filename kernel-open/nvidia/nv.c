@@ -1319,25 +1319,22 @@ NV_STATUS NV_API_CALL nv_scone_gpu_acquire(
 }
 
 void NV_API_CALL nv_scone_gpu_release(
-    nv_state_t *nv,
     const nv_scone_gpu_lease_token_t *token
 )
 {
 #if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
-    struct gpu_security_identity identity;
     struct gpu_security_lease_token security_token;
 
-    if (!nv_scone_gpu_lease_token_valid(token) ||
-        (nv_scone_gpu_identity(nv, &identity) != 0))
+    if (!nv_scone_gpu_lease_token_valid(token))
         return;
     security_token.assignment_generation = token->assignment_generation;
     security_token.member_id = token->member_id;
-    security_gpu_device_release(&identity, &security_token);
+    security_gpu_device_release(&security_token);
 #else
-    (void)nv;
     (void)token;
 #endif
 }
+EXPORT_SYMBOL_GPL(nv_scone_gpu_release);
 
 NvBool NV_API_CALL nv_scone_gpu_exclusive_enabled(void)
 {
@@ -1453,24 +1450,6 @@ NV_STATUS NV_API_CALL nv_scone_gpu_acquire_uuid(
 }
 EXPORT_SYMBOL_GPL(nv_scone_gpu_acquire_uuid);
 
-void NV_API_CALL nv_scone_gpu_release_uuid(
-    const NvU8 *uuid,
-    const nv_scone_gpu_lease_token_t *token
-)
-{
-    nv_linux_state_t *nvl;
-
-    if ((uuid == NULL) || !nv_scone_gpu_lease_token_valid(token))
-        return;
-
-    nvl = find_uuid(uuid);
-    if (nvl == NULL)
-        return;
-    nv_scone_gpu_release(NV_STATE_PTR(nvl), token);
-    up(&nvl->ldata_lock);
-}
-EXPORT_SYMBOL_GPL(nv_scone_gpu_release_uuid);
-
 static NV_STATUS nv_scone_gpu_authorize_id(NvU32 gpu_id, NvU32 operation)
 {
     nv_linux_state_t *nvl;
@@ -1502,36 +1481,17 @@ static NV_STATUS nv_scone_gpu_acquire_id(
     return status;
 }
 
-static void nv_scone_gpu_release_id(
-    NvU32 gpu_id,
-    const nv_scone_gpu_lease_token_t *token
-)
-{
-    nv_linux_state_t *nvl;
-
-    if (!nv_scone_gpu_lease_token_valid(token))
-        return;
-    nvl = find_gpu_id(gpu_id);
-    if (nvl == NULL)
-        return;
-    nv_scone_gpu_release(NV_STATE_PTR(nvl), token);
-    up(&nvl->ldata_lock);
-}
-
 static void nv_scone_gpu_file_lease_release(
     nv_linux_file_private_t *nvlfp
 )
 {
     if ((nvlfp == NULL) ||
-        !nv_scone_gpu_lease_token_valid(&nvlfp->scone_gpu_lease_token) ||
-        (nvlfp->scone_gpu_lease_nvl == NULL))
+        !nv_scone_gpu_lease_token_valid(&nvlfp->scone_gpu_lease_token))
         return;
 
-    nv_scone_gpu_release(NV_STATE_PTR(nvlfp->scone_gpu_lease_nvl),
-                         &nvlfp->scone_gpu_lease_token);
+    nv_scone_gpu_release(&nvlfp->scone_gpu_lease_token);
     memset(&nvlfp->scone_gpu_lease_token, 0,
            sizeof(nvlfp->scone_gpu_lease_token));
-    nvlfp->scone_gpu_lease_nvl = NULL;
 }
 
 /*
@@ -2240,7 +2200,6 @@ nvidia_open(
         up_read(&nv_system_pm_lock);
         goto failed;
     }
-    nvlfp->scone_gpu_lease_nvl = nvl;
     nv_init_mapping_revocation(nvl, file, nvlfp, inode);
 
     if (nv_try_lock_foreground_open(file, nvl) == 0)
@@ -2995,8 +2954,7 @@ nvidia_ioctl(
                         &lease_tokens[i]) != NV_OK))
                 {
                     while (i--)
-                        nv_scone_gpu_release_id(
-                            ((NvU32 *)arg_copy)[i], &lease_tokens[i]);
+                        nv_scone_gpu_release(&lease_tokens[i]);
                     NV_KFREE(lease_tokens,
                              sizeof(*lease_tokens) * num_arg_gpus);
                     status = -EACCES;
@@ -3011,8 +2969,7 @@ nvidia_ioctl(
             {
                 up(&nvl->ldata_lock);
                 for (i = 0; i < num_arg_gpus; i++)
-                    nv_scone_gpu_release_id(
-                        ((NvU32 *)arg_copy)[i], &lease_tokens[i]);
+                    nv_scone_gpu_release(&lease_tokens[i]);
                 NV_KFREE(lease_tokens,
                          sizeof(*lease_tokens) * num_arg_gpus);
                 status = -EINVAL;
@@ -3024,8 +2981,7 @@ nvidia_ioctl(
             {
                 up(&nvl->ldata_lock);
                 for (i = 0; i < num_arg_gpus; i++)
-                    nv_scone_gpu_release_id(
-                        ((NvU32 *)arg_copy)[i], &lease_tokens[i]);
+                    nv_scone_gpu_release(&lease_tokens[i]);
                 NV_KFREE(lease_tokens,
                          sizeof(*lease_tokens) * num_arg_gpus);
                 status = -ENOMEM;
@@ -3062,8 +3018,7 @@ nvidia_ioctl(
                     up(&nvl->ldata_lock);
 
                     for (i = 0; i < num_arg_gpus; i++)
-                        nv_scone_gpu_release_id(
-                            ((NvU32 *)arg_copy)[i], &lease_tokens[i]);
+                        nv_scone_gpu_release(&lease_tokens[i]);
                     NV_KFREE(lease_tokens,
                              sizeof(*lease_tokens) * num_arg_gpus);
 
@@ -3640,10 +3595,9 @@ nvidia_ctl_close(
 
         for (i = 0; i < nvlfp->num_attached_gpus; i++)
         {
-            nv_scone_gpu_release_id(nvlfp->attached_gpus[i],
-                                    &nvlfp->scone_gpu_lease_tokens[i]);
             if (nvlfp->attached_gpus[i] != 0)
                 nvidia_dev_put(nvlfp->attached_gpus[i], sp, NV_FALSE /* reset_aware */);
+            nv_scone_gpu_release(&nvlfp->scone_gpu_lease_tokens[i]);
         }
 
         NV_KFREE(nvlfp->scone_gpu_lease_tokens,
