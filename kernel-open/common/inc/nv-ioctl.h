@@ -155,4 +155,27 @@ typedef struct nv_ioctl_wait_open_complete
     NvU32 adapterStatus;
 } nv_ioctl_wait_open_complete_t;
 
+/*
+ * Read-only SCONE record for the physical GPU selected by this file
+ * descriptor. UUID and PCI values are locators, not attestation proof. The
+ * caller must set version to NV_SCONE_GPU_INFO_VERSION and every other byte
+ * to zero. The current TD must hold the record and have DISCOVER permission.
+ */
+#define NV_SCONE_GPU_INFO_VERSION                 1U
+#define NV_SCONE_GPU_INFO_UUID_SIZE               16U
+#define NV_SCONE_GPU_ACCESS_MODE_SAME_TD_INSTANCE 2U
+#define NV_SCONE_GPU_ACCESS_MODE_SHARE_ACROSS_TD  7U
+
+typedef struct nv_ioctl_scone_gpu_info
+{
+    NvU32 version;
+    NvU32 access_mode;
+    NvU8  uuid[NV_SCONE_GPU_INFO_UUID_SIZE];
+    NvU16 pci_domain;
+    NvU8  pci_bus;
+    NvU8  pci_slot;
+    NvU8  pci_function;
+    NvU8  reserved[3];
+} nv_ioctl_scone_gpu_info_t;
+
 #endif

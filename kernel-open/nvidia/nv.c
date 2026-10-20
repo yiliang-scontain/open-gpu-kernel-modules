@@ -2695,6 +2695,69 @@ out:
     return rc;
 }
 
+static int nvidia_read_scone_gpu_info(
+    nv_linux_state_t *nvl,
+    nv_ioctl_scone_gpu_info_t *info
+)
+{
+    const NvU8 *input = (const NvU8 *)info;
+    size_t i;
+
+    static_assert(sizeof(*info) == 32);
+    static_assert(GPU_UUID_LEN == NV_SCONE_GPU_INFO_UUID_SIZE);
+
+    if ((nvl == NULL) || (info == NULL))
+        return -EINVAL;
+
+    if (info->version != NV_SCONE_GPU_INFO_VERSION)
+        return -EINVAL;
+
+    /* Every field after version is output-only in version 1. */
+    for (i = sizeof(info->version); i < sizeof(*info); i++)
+    {
+        if (input[i] != 0)
+            return -EINVAL;
+    }
+
+#if IS_ENABLED(CONFIG_SECURITY_SCONE_DOMAIN_V3_EXCLUSIVE_GPU)
+    {
+        struct gpu_security_device_info security_info = {};
+        struct gpu_security_identity identity;
+        nv_state_t *nv = NV_STATE_PTR(nvl);
+        int ret;
+
+        static_assert((NvU32)NV_SCONE_GPU_ACCESS_MODE_SAME_TD_INSTANCE ==
+                      (NvU32)GPU_SECURITY_ACCESS_MODE_SAME_TD_INSTANCE);
+        static_assert((NvU32)NV_SCONE_GPU_ACCESS_MODE_SHARE_ACROSS_TD ==
+                      (NvU32)GPU_SECURITY_ACCESS_MODE_SHARE_ACROSS_TD);
+
+        ret = nv_scone_gpu_identity(nv, &identity);
+        if (ret != 0)
+            return ret;
+        ret = security_gpu_device_query(&identity, &security_info);
+        if (ret != 0)
+            return ret;
+        if ((security_info.access_mode !=
+             GPU_SECURITY_ACCESS_MODE_SAME_TD_INSTANCE) &&
+            (security_info.access_mode !=
+             GPU_SECURITY_ACCESS_MODE_SHARE_ACROSS_TD))
+            return -EACCES;
+
+        memset(info, 0, sizeof(*info));
+        info->version = NV_SCONE_GPU_INFO_VERSION;
+        info->access_mode = security_info.access_mode;
+        memcpy(info->uuid, security_info.identity.uuid, sizeof(info->uuid));
+        info->pci_domain = security_info.identity.pci_domain;
+        info->pci_bus = security_info.identity.pci_bus;
+        info->pci_slot = security_info.identity.pci_slot;
+        info->pci_function = security_info.identity.pci_function;
+        return 0;
+    }
+#else
+    return -EOPNOTSUPP;
+#endif
+}
+
 static NV_STATUS nv_validate_ioctls(unsigned int cmd)
 {
     size_t arg_size = _IOC_SIZE(cmd);
@@ -2718,6 +2781,7 @@ static NV_STATUS nv_validate_ioctls(unsigned int cmd)
         _NV_IOCTL_ENTRY(NV_ESC_SYS_PARAMS, nv_ioctl_sys_params_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_EXPORT_TO_DMABUF_FD, nv_ioctl_export_to_dma_buf_fd_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_WAIT_OPEN_COMPLETE, nv_ioctl_wait_open_complete_t, NV_FALSE),
+        _NV_IOCTL_ENTRY(NV_ESC_SCONE_GPU_INFO, nv_ioctl_scone_gpu_info_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_NUMA_INFO, nv_ioctl_numa_info_t, NV_FALSE),
         _NV_IOCTL_ENTRY(NV_ESC_SET_NUMA_STATUS, nv_ioctl_set_numa_status_t, NV_FALSE),
     };
@@ -2862,6 +2926,7 @@ nvidia_ioctl(
     nv = NV_STATE_PTR(nvl);
 
     if (!NV_IS_CTL_DEVICE(nv) &&
+        (arg_cmd != NV_ESC_SCONE_GPU_INFO) &&
         (nv_scone_gpu_authorize(nv,
                                 NV_SCONE_GPU_OPERATION_CONTROL) != NV_OK))
     {
@@ -2892,6 +2957,14 @@ nvidia_ioctl(
 
     switch (arg_cmd)
     {
+        case NV_ESC_SCONE_GPU_INFO:
+        {
+            NV_ACTUAL_DEVICE_ONLY(nv);
+
+            status = nvidia_read_scone_gpu_info(nvl, arg_copy);
+            break;
+        }
+
         case NV_ESC_QUERY_DEVICE_INTR:
         {
             nv_ioctl_query_device_intr_t *query_intr = arg_copy;

@@ -11,9 +11,10 @@ target kernel enables
 
 The security boundary has the following driver-side patch points:
 
-1. `nvidia.ko` registers each physical `/dev/nvidiaN` minor with its immutable
-   raw GPU UUID and PCI domain/bus/slot/function after probe and before the
-   minor is published.  Probe fails closed if registration fails.  Removal
+1. `nvidia.ko` registers each physical `/dev/nvidiaN` minor with its raw GPU
+   UUID and PCI domain/bus/slot/function after probe and before the minor is
+   published.  These fields are driver-owned locators, not cryptographic
+   device identity.  Probe fails closed if registration fails.  Removal
    unregisters the minor before its number can be reused.
 2. `nvidia.ko` registers `/dev/nvidiactl` as a global control gateway before
    publishing its character device and unregisters it before deletion.
@@ -57,6 +58,28 @@ attachment through completed driver teardown.  TD admission fails while any
 host lease exists.  The lease is deliberately released from NVIDIA's actual
 close or VA-space destruction path, not the VFS file release path, because
 both core RM and UVM can defer teardown to driver kernel threads.
+
+## FD-bound device information
+
+An admitted process can issue `NV_ESC_SCONE_GPU_INFO` on an already-open
+physical `/dev/nvidiaN` file descriptor.  The caller initializes
+`nv_ioctl_scone_gpu_info_t.version` to `NV_SCONE_GPU_INFO_VERSION` and leaves
+every other byte zero.  The driver reconstructs the identity associated with
+that descriptor and asks `security_gpu_device_query()` for the current
+authorized kernel record.  On success the ioctl returns that record's raw GPU
+UUID, PCI function, and access mode.  The only valid modes are
+`NV_SCONE_GPU_ACCESS_MODE_SAME_TD_INSTANCE` and
+`NV_SCONE_GPU_ACCESS_MODE_SHARE_ACROSS_TD`.
+
+The ioctl accepts only a physical GPU descriptor, is unavailable when SCONE
+exclusive-GPU support is disabled, and succeeds only for an active TD member
+whose policy and live record both authorize `DISCOVER` with the same mode.  A
+host process, kernel thread, stale or draining TD, absent GPU, or mode mismatch
+receives no record.  It never accepts a GPU ID, UUID, PCI address, or device
+path as an input selector.  Returned UUID and PCI fields are suitable for
+correlating the descriptor with NVIDIA evidence collection, but they are not
+attestation claims and must not be used as the confidential-computing identity
+of the GPU.
 
 ## Security assumptions and unsupported configurations
 
